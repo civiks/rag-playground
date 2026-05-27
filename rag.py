@@ -4,6 +4,9 @@ import os
 # Silence transformers' lazy-import deprecation noise.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+# Stop HF hub from showing download progress bars and doing a network check on every cache hit.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 import time
 from dataclasses import dataclass
@@ -47,9 +50,15 @@ class RagResult:
     hits: list[Hit]
     latency_s: float
     collection: str
+    strategy: str
 
 
-def answer(question: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> RagResult:
+def answer(
+    question: str,
+    k: int = 5,
+    collection: str = DEFAULT_COLLECTION,
+    strategy: str = "dense",
+) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
     with tracer.start_as_current_span("rag.pipeline") as span:
@@ -57,12 +66,14 @@ def answer(question: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> R
         span.set_attribute("input.value", question)
         span.set_attribute("retrieval.k", k)
         span.set_attribute("retrieval.collection", collection)
+        span.set_attribute("retrieval.strategy", strategy)
 
         with tracer.start_as_current_span("rag.retrieve") as r_span:
             r_span.set_attribute("openinference.span.kind", "RETRIEVER")
             r_span.set_attribute("input.value", question)
             r_span.set_attribute("retrieval.collection", collection)
-            hits = retrieve(question, k=k, collection=collection)
+            r_span.set_attribute("retrieval.strategy", strategy)
+            hits = retrieve(question, k=k, collection=collection, strategy=strategy)
             r_span.set_attribute("retrieval.num_hits", len(hits))
             for i, h in enumerate(hits):
                 p = f"retrieval.documents.{i}.document"
@@ -87,7 +98,7 @@ def answer(question: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> R
     latency_s = time.perf_counter() - start
     return RagResult(
         question=question, answer=ans, hits=hits,
-        latency_s=latency_s, collection=collection,
+        latency_s=latency_s, collection=collection, strategy=strategy,
     )
 
 
