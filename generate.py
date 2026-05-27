@@ -21,6 +21,8 @@ class Answer:
     text: str
     model: str
     citations_used: list[int]
+    input_tokens: int
+    output_tokens: int
 
 
 _client: genai.Client | None = None
@@ -60,4 +62,10 @@ def generate(question: str, hits: list[Hit]) -> Answer:
     )
     text = resp.text or ""
     citations = [i for i in range(1, len(hits) + 1) if f"[{i}]" in text]
-    return Answer(text=text, model=MODEL, citations_used=citations)
+    usage = getattr(resp, "usage_metadata", None)
+    in_tok = getattr(usage, "prompt_token_count", 0) or 0
+    out_tok = getattr(usage, "candidates_token_count", 0) or 0
+    return Answer(
+        text=text, model=MODEL, citations_used=citations,
+        input_tokens=in_tok, output_tokens=out_tok,
+    )

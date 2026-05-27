@@ -5,18 +5,33 @@ import streamlit as st
 
 from rag import answer
 
+CHUNKING_STRATEGIES = {
+    "Naive (1200-char sliding)": "naive_1200",
+    "Docling hybrid (structure-aware)": "docling_hybrid",
+}
+
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
 st.title("RAG Playground")
 st.caption("Gemini · BGE embeddings · Qdrant · Phoenix traces on :6006")
 
 with st.sidebar:
+    st.header("Strategy")
+    chunking_label = st.selectbox(
+        "Chunking",
+        list(CHUNKING_STRATEGIES.keys()),
+        help="Naive splits by character count and shreds tables. Docling hybrid respects document structure.",
+    )
+    chunking = CHUNKING_STRATEGIES[chunking_label]
+
+    st.divider()
     st.header("Knobs")
     k = st.slider("Top-k chunks to retrieve", min_value=1, max_value=15, value=5)
+
     st.divider()
     st.markdown(
         "**Phoenix UI:** [localhost:6006](http://localhost:6006)\n\n"
-        "Open it to see traces with timings, retrieved chunks, and Gemini calls."
+        "Open it to see traces, retrieved chunks, and Gemini calls."
     )
 
 question = st.text_input(
@@ -26,7 +41,13 @@ question = st.text_input(
 
 if question:
     with st.spinner("Retrieving + generating ..."):
-        result = answer(question, k=k)
+        result = answer(question, k=k, collection=f"rag_{chunking}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Latency", f"{result.latency_s:.2f}s")
+    m2.metric("Input tokens", result.answer.input_tokens)
+    m3.metric("Output tokens", result.answer.output_tokens)
+    m4.metric("Chunks retrieved", len(result.hits))
 
     col_a, col_b = st.columns([3, 2])
     with col_a:
@@ -36,7 +57,7 @@ if question:
             st.success(f"Model cited chunks: {result.answer.citations_used}")
         else:
             st.warning("Model didn't cite any chunks — possible hallucination or refusal.")
-        st.caption(f"Model: {result.answer.model}")
+        st.caption(f"Model: {result.answer.model} · Collection: {result.collection}")
 
     with col_b:
         st.subheader(f"Retrieved chunks (top {k})")

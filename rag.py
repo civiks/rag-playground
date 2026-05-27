@@ -5,6 +5,7 @@ import os
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
+import time
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 from generate import Answer, generate
-from retrieve import Hit, retrieve
+from retrieve import DEFAULT_COLLECTION, Hit, retrieve
 
 load_dotenv()
 
@@ -44,19 +45,24 @@ class RagResult:
     question: str
     answer: Answer
     hits: list[Hit]
+    latency_s: float
+    collection: str
 
 
-def answer(question: str, k: int = 5) -> RagResult:
+def answer(question: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> RagResult:
     tracer = _init_phoenix()
+    start = time.perf_counter()
     with tracer.start_as_current_span("rag.pipeline") as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", question)
         span.set_attribute("retrieval.k", k)
+        span.set_attribute("retrieval.collection", collection)
 
         with tracer.start_as_current_span("rag.retrieve") as r_span:
             r_span.set_attribute("openinference.span.kind", "RETRIEVER")
             r_span.set_attribute("input.value", question)
-            hits = retrieve(question, k=k)
+            r_span.set_attribute("retrieval.collection", collection)
+            hits = retrieve(question, k=k, collection=collection)
             r_span.set_attribute("retrieval.num_hits", len(hits))
             for i, h in enumerate(hits):
                 p = f"retrieval.documents.{i}.document"
@@ -70,11 +76,19 @@ def answer(question: str, k: int = 5) -> RagResult:
             g_span.set_attribute("input.value", question)
             ans = generate(question, hits)
             g_span.set_attribute("output.value", ans.text)
+            g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
+            g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
 
         span.set_attribute("output.value", ans.text)
         span.set_attribute("citations.used", str(ans.citations_used))
+        span.set_attribute("llm.token_count.prompt", ans.input_tokens)
+        span.set_attribute("llm.token_count.completion", ans.output_tokens)
 
-    return RagResult(question=question, answer=ans, hits=hits)
+    latency_s = time.perf_counter() - start
+    return RagResult(
+        question=question, answer=ans, hits=hits,
+        latency_s=latency_s, collection=collection,
+    )
 
 
 if __name__ == "__main__":

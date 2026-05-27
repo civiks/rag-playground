@@ -7,7 +7,7 @@ from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
 QDRANT_PATH = Path(__file__).parent / "data" / "qdrant"
-COLLECTION = "rag_playground"
+DEFAULT_COLLECTION = "rag_naive_1200"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 
@@ -37,11 +37,11 @@ def _get_client() -> QdrantClient:
     return _client
 
 
-def retrieve(query: str, k: int = 5) -> list[Hit]:
+def retrieve(query: str, k: int = 5, collection: str = DEFAULT_COLLECTION) -> list[Hit]:
     embedder = _get_embedder()
     client = _get_client()
     vec = embedder.encode([query], normalize_embeddings=True)[0].tolist()
-    res = client.query_points(collection_name=COLLECTION, query=vec, limit=k).points
+    res = client.query_points(collection_name=collection, query=vec, limit=k).points
     return [
         Hit(
             text=p.payload["text"],
