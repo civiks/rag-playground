@@ -4,15 +4,27 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
 from qdrant_client import QdrantClient
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
+
+
+def _best_device() -> str:
+    """MPS on Apple Silicon, CUDA on Linux/Windows GPUs, else CPU. Both BGE models
+    run fine on MPS — unlike Docling's layout model, which hits float64 and crashes."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 QDRANT_PATH = Path(__file__).parent / "data" / "qdrant"
 DEFAULT_COLLECTION = "rag_naive_1200"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 RRF_K = 60
-PREFETCH_N = 20  # how many to pull from each branch before fusing
+PREFETCH_N = 20  # how many to pull from each branch before fusing / before reranking
 
 
 @dataclass
@@ -24,6 +36,7 @@ class Hit:
 
 
 _embedder: SentenceTransformer | None = None
+_reranker: CrossEncoder | None = None
 _client: QdrantClient | None = None
 _bm25_cache: dict[str, tuple[BM25Okapi, list[dict]]] = {}
 
@@ -31,8 +44,15 @@ _bm25_cache: dict[str, tuple[BM25Okapi, list[dict]]] = {}
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL)
+        _embedder = SentenceTransformer(EMBED_MODEL, device=_best_device())
     return _embedder
+
+
+def _get_reranker() -> CrossEncoder:
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder(RERANKER_MODEL, device=_best_device())
+    return _reranker
 
 
 def _get_client() -> QdrantClient:
@@ -43,6 +63,9 @@ def _get_client() -> QdrantClient:
 
 
 def _tokenize(text: str) -> list[str]:
+    # Strip Docling placeholders so the literal word `formula` inside
+    # `<!-- formula-not-decoded -->` doesn't game BM25 on formula queries.
+    text = text.replace("<!-- formula-not-decoded -->", "").replace("<!-- image -->", "")
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
@@ -109,3 +132,20 @@ def retrieve(query: str, k: int = 5, collection: str = DEFAULT_COLLECTION, strat
         bm25 = _retrieve_bm25(query, k=PREFETCH_N, collection=collection)
         return _rrf_fuse([dense, bm25], k=k)
     return _retrieve_dense(query, k=k, collection=collection)
+
+
+def rerank_hits(query: str, hits: list[Hit], k: int) -> list[Hit]:
+    """Cross-encoder rescores (query, chunk) pairs jointly; returns top-k by relevance.
+
+    Unlike dense/BM25 which score query and chunk independently and then compare,
+    a cross-encoder feeds both into a transformer together — so it can model
+    fine-grained relevance ("does this chunk actually *answer* this question?").
+    """
+    reranker = _get_reranker()
+    pairs = [(query, h.text) for h in hits]
+    scores = reranker.predict(pairs)
+    scored = sorted(zip(scores, hits), key=lambda x: -x[0])[:k]
+    return [
+        Hit(text=h.text, source=h.source, chunk_idx=h.chunk_idx, score=float(s))
+        for s, h in scored
+    ]

@@ -26,6 +26,11 @@ RETRIEVAL_STRATEGIES = {
     "Hybrid (BM25 + dense, RRF)": "hybrid",
 }
 
+RERANK_OPTIONS = {
+    "Off": False,
+    "BGE reranker v2-m3": True,
+}
+
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
 st.title("RAG Playground")
@@ -46,6 +51,13 @@ with st.sidebar:
         help="Dense uses cosine on embeddings. Hybrid adds BM25 (keyword) and fuses via Reciprocal Rank Fusion.",
     )
     retrieval = RETRIEVAL_STRATEGIES[retrieval_label]
+
+    rerank_label = st.selectbox(
+        "Reranking",
+        list(RERANK_OPTIONS.keys()),
+        help="Cross-encoder rescores (query, chunk) pairs jointly. Catches relevance failures BM25/dense miss (e.g. junk chunks that just have the right keywords).",
+    )
+    rerank = RERANK_OPTIONS[rerank_label]
 
     st.divider()
     st.header("Knobs")
@@ -72,10 +84,13 @@ if "history" not in st.session_state:
 
 if submitted and question:
     with st.spinner("Retrieving + generating ..."):
-        result = answer(question, k=k, collection=f"rag_{chunking}", strategy=retrieval)
+        result = answer(
+            question, k=k, collection=f"rag_{chunking}", strategy=retrieval, rerank=rerank,
+        )
     st.session_state.history.insert(0, {
         "chunking_label": chunking_label,
         "retrieval_label": retrieval_label,
+        "rerank_label": rerank_label,
         "k": k,
         "result": result,
     })
@@ -102,6 +117,7 @@ def _render(entry: dict) -> None:
             f"Model: {result.answer.model} · "
             f"Chunking: {entry['chunking_label']} · "
             f"Retrieval: {entry['retrieval_label']} · "
+            f"Rerank: {entry['rerank_label']} · "
             f"k={k}"
         )
 
@@ -126,7 +142,7 @@ for idx, entry in enumerate(st.session_state.history):
     q_short = result.question if len(result.question) <= 70 else result.question[:67] + "..."
     header = (
         f"Q: {q_short}  ·  "
-        f"{entry['chunking_label']} / {entry['retrieval_label']}  ·  "
+        f"{entry['chunking_label']} / {entry['retrieval_label']} / rerank={entry['rerank_label']}  ·  "
         f"k={entry['k']}  ·  "
         f"{result.latency_s:.2f}s  ·  "
         f"{result.answer.input_tokens}+{result.answer.output_tokens} tok"

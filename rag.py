@@ -18,7 +18,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
 from generate import Answer, generate
-from retrieve import DEFAULT_COLLECTION, Hit, retrieve
+from retrieve import DEFAULT_COLLECTION, PREFETCH_N, RERANKER_MODEL, Hit, rerank_hits, retrieve
 
 load_dotenv()
 
@@ -51,6 +51,7 @@ class RagResult:
     latency_s: float
     collection: str
     strategy: str
+    rerank: bool
 
 
 def answer(
@@ -58,22 +59,30 @@ def answer(
     k: int = 5,
     collection: str = DEFAULT_COLLECTION,
     strategy: str = "dense",
+    rerank: bool = False,
 ) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
-    with tracer.start_as_current_span("rag.pipeline") as span:
+    fetch_k = PREFETCH_N if rerank else k
+    # Encode the config in the span name so the Phoenix trace list is scannable
+    # at a glance instead of every row reading "rag.pipeline".
+    chunking_tag = collection.removeprefix("rag_")
+    rerank_tag = "rerank" if rerank else "norerank"
+    span_name = f"rag.pipeline [{chunking_tag} · {strategy} · {rerank_tag} · k={k}]"
+    with tracer.start_as_current_span(span_name) as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", question)
         span.set_attribute("retrieval.k", k)
         span.set_attribute("retrieval.collection", collection)
         span.set_attribute("retrieval.strategy", strategy)
+        span.set_attribute("retrieval.rerank", rerank)
 
         with tracer.start_as_current_span("rag.retrieve") as r_span:
             r_span.set_attribute("openinference.span.kind", "RETRIEVER")
             r_span.set_attribute("input.value", question)
             r_span.set_attribute("retrieval.collection", collection)
             r_span.set_attribute("retrieval.strategy", strategy)
-            hits = retrieve(question, k=k, collection=collection, strategy=strategy)
+            hits = retrieve(question, k=fetch_k, collection=collection, strategy=strategy)
             r_span.set_attribute("retrieval.num_hits", len(hits))
             for i, h in enumerate(hits):
                 p = f"retrieval.documents.{i}.document"
@@ -81,6 +90,30 @@ def answer(
                 r_span.set_attribute(f"{p}.content", h.text)
                 r_span.set_attribute(f"{p}.score", h.score)
                 r_span.set_attribute(f"{p}.metadata", f'{{"source":"{h.source}","chunk_idx":{h.chunk_idx}}}')
+
+        if rerank:
+            pre_rerank = hits
+            with tracer.start_as_current_span("rag.rerank") as rr_span:
+                rr_span.set_attribute("openinference.span.kind", "RERANKER")
+                rr_span.set_attribute("reranker.query", question)
+                rr_span.set_attribute("reranker.model_name", RERANKER_MODEL)
+                rr_span.set_attribute("reranker.top_k", k)
+                rr_span.set_attribute("input.value", question)
+                for i, h in enumerate(pre_rerank):
+                    p = f"reranker.input_documents.{i}.document"
+                    rr_span.set_attribute(f"{p}.id", f"{h.source}:{h.chunk_idx}")
+                    rr_span.set_attribute(f"{p}.content", h.text)
+                    rr_span.set_attribute(f"{p}.score", h.score)
+                hits = rerank_hits(question, pre_rerank, k=k)
+                for i, h in enumerate(hits):
+                    p = f"reranker.output_documents.{i}.document"
+                    rr_span.set_attribute(f"{p}.id", f"{h.source}:{h.chunk_idx}")
+                    rr_span.set_attribute(f"{p}.content", h.text)
+                    rr_span.set_attribute(f"{p}.score", h.score)
+                rr_span.set_attribute(
+                    "output.value",
+                    ", ".join(f"{h.source}:{h.chunk_idx}" for h in hits),
+                )
 
         with tracer.start_as_current_span("rag.generate") as g_span:
             g_span.set_attribute("openinference.span.kind", "CHAIN")
@@ -98,7 +131,7 @@ def answer(
     latency_s = time.perf_counter() - start
     return RagResult(
         question=question, answer=ans, hits=hits,
-        latency_s=latency_s, collection=collection, strategy=strategy,
+        latency_s=latency_s, collection=collection, strategy=strategy, rerank=rerank,
     )
 
 
