@@ -4,53 +4,90 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import tempfile
+import threading
 
 import streamlit as st
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
+from ingest import chunks_naive, chunks_parent_child, chunks_semantic
 from rag import answer_stream
-# from retrieve import _get_client, _get_embedder, _get_reranker
-from retrieve import _get_embedder
+from retrieve import _get_client, _get_embedder, _get_reranker
 
 
-# @st.cache_resource(show_spinner="Loading models + vector DB")
-# def _warm() -> bool:
-#     _get_embedder()
-#     _get_reranker()
-#     _get_client()
-#     return True
+@st.cache_resource(show_spinner=False)
+def _start_background_warmup() -> bool:
+    """Load embedder, reranker, Qdrant client in a daemon thread so the UI renders
+    immediately. By the time the user types a question, models are already in memory."""
+    def _warm() -> None:
+        try:
+            _get_embedder()
+            _get_client()
+            _get_reranker()
+        except Exception:
+            pass
+    threading.Thread(target=_warm, daemon=True, name="rag-warmup").start()
+    return True
 
 
-# _warm()
+_start_background_warmup()
 
 
-def _ingest_upload(pdf_bytes: bytes, embedder) -> QdrantClient:
-    """Parse an uploaded PDF, chunk it, embed it, and return an in-memory Qdrant client.
+_CITE_PATTERN = re.compile(r"\[(\d+)\]")
 
-    Uses pypdf for parsing (no ML models) so hosted deployments don't need Docling.
-    Simple sliding-window chunking matches the naive_1200 strategy.
-    """
-    from pypdf import PdfReader
+_CHIP_STYLE = (
+    "color:#0a84ff;background:rgba(10,132,255,0.18);"
+    "padding:0 6px;border-radius:4px;margin:0 1px;"
+    "font-size:0.78em;font-weight:700;vertical-align:super;"
+    "line-height:1.4;text-decoration:none;"
+)
 
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
-    # Sliding-window chunks (1200 chars, 200 overlap) — same as naive_1200 strategy.
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = start + 1200
-        chunks.append(text[start:end])
-        if end >= len(text):
-            break
-        start = end - 200
+def _render_citations(text: str, hits) -> str:
+    """Turn inline `[N]` markers into small raised blue chips."""
+    def replace(m: re.Match) -> str:
+        n = int(m.group(1))
+        if not (1 <= n <= len(hits)):
+            return m.group(0)
+        return f'<sup style="{_CHIP_STYLE}">[{n}]</sup>'
+    return _CITE_PATTERN.sub(replace, text)
 
-    if not chunks:
-        raise RuntimeError("Could not extract text from the uploaded PDF. Try a text-based PDF.")
 
-    vectors = embedder.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
+def _render_cited_sources(hits, citations: list[int]) -> None:
+    """Render a compact 'Cited sources' inline block below the answer."""
+    if not citations:
+        return
+    for n in citations:
+        if not (1 <= n <= len(hits)):
+            continue
+        h = hits[n - 1]
+        snippet = h.text.strip().replace("\n", " ")
+        if len(snippet) > 360:
+            snippet = snippet[:357] + "…"
+        st.markdown(
+            f'<div style="border-left:3px solid #0a84ff;background:rgba(10,132,255,0.08);'
+            f'padding:6px 10px;margin:4px 0;border-radius:0 4px 4px 0;'
+            f'font-size:0.85em;color:inherit;">'
+            f'<span style="color:#0a84ff;font-weight:700;">[{n}]</span> '
+            f'<span style="opacity:0.65;font-size:0.85em;">'
+            f'<code style="background:transparent;padding:0;">{_escape(h.source)}</code>'
+            f' · chunk {h.chunk_idx} · score {h.score:.2f}</span>'
+            f'<div style="margin-top:3px;color:inherit;opacity:0.92;">{_escape(snippet)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
+
+def _escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;"))
+
+
+@st.cache_resource(show_spinner=False)
+def _ingest_full(pdf_hash: str, _pdf_bytes: bytes) -> tuple[QdrantClient, set[str]]:
+    """Cached by sha1(pdf_bytes) — same file never re-ingested across sessions."""
     embedder = _get_embedder()
     dim = embedder.get_embedding_dimension()
     client = QdrantClient(":memory:")
@@ -356,9 +393,12 @@ for entry in st.session_state.history:
     with st.chat_message("user"):
         st.markdown(entry["question"])
     with st.chat_message("assistant"):
-        st.markdown(entry["answer_text"])
+        st.markdown(
+            _render_citations(entry["answer_text"], entry["meta"].hits),
+            unsafe_allow_html=True,
+        )
         if entry["citations"]:
-            st.success(f"Cited chunks: {entry['citations']}")
+            _render_cited_sources(entry["meta"].hits, entry["citations"])
         else:
             st.info("Model didn't emit `[#]` markers — see the panel below for what was retrieved.")
         _render_details(entry)
@@ -391,6 +431,7 @@ if question := st.chat_input("Ask a question about your PDF"):
 
     with st.chat_message("assistant"):
         usage_out: dict = {}
+        answer_slot = st.empty()
         try:
             spinner_msg = "Agent thinking..." if auto else "Retrieving..."
             with st.spinner(spinner_msg):
@@ -401,14 +442,19 @@ if question := st.chat_input("Ask a question about your PDF"):
                     api_key=_gemini_api_key, client=active_client,
                 )
                 meta = next(gen)
-            answer_text = st.write_stream(gen)
+            answer_text = answer_slot.write_stream(gen)
         except RuntimeError as e:
             st.error(str(e))
             st.stop()
 
+        answer_slot.markdown(
+            _render_citations(answer_text, meta.hits),
+            unsafe_allow_html=True,
+        )
+
         citations = usage_out.get("citations", [])
         if citations:
-            st.success(f"Cited chunks: {citations}")
+            _render_cited_sources(meta.hits, citations)
         else:
             st.info("Model didn't emit `[#]` markers — see the panel below for what was retrieved.")
 

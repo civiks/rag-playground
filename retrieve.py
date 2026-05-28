@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,29 +40,41 @@ _reranker: CrossEncoder | None = None
 _client: QdrantClient | None = None
 _bm25_cache: dict[str, tuple[BM25Okapi, list[dict]]] = {}
 
+# Locks prevent the background warmup thread + main thread from double-loading
+# the same model (wastes ~300 MB and risks OOM on Streamlit Cloud's 1 GB tier).
+_embedder_lock = threading.Lock()
+_reranker_lock = threading.Lock()
+_client_lock = threading.Lock()
+
 
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL, device=_best_device())
+        with _embedder_lock:
+            if _embedder is None:
+                _embedder = SentenceTransformer(EMBED_MODEL, device=_best_device())
     return _embedder
 
 
 def _get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
-        _reranker = CrossEncoder(RERANKER_MODEL, device=_best_device())
+        with _reranker_lock:
+            if _reranker is None:
+                _reranker = CrossEncoder(RERANKER_MODEL, device=_best_device())
     return _reranker
 
 
 def _get_client() -> QdrantClient:
     global _client
     if _client is None:
-        url = os.environ.get("QDRANT_URL")
-        if url:
-            _client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
-        else:
-            _client = QdrantClient(path=str(QDRANT_PATH))
+        with _client_lock:
+            if _client is None:
+                url = os.environ.get("QDRANT_URL")
+                if url:
+                    _client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
+                else:
+                    _client = QdrantClient(path=str(QDRANT_PATH))
     return _client
 
 

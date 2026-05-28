@@ -1,6 +1,8 @@
-> A playground for experimenting with RAG techniques.
+> A playground for experimenting with Retrieval-Augmented Generation (RAG) techniques.
 
-[Live demo](https://civiks-rag-playground.streamlit.app/) · bring your own Gemini key (free at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)).
+[Live demo](https://civiks-rag-playground.streamlit.app/)
+
+![screenshot](docs/image.png)
 
 ## Run
 
@@ -14,7 +16,7 @@ make phoenix &              # optional, trace UI on :6006
 make app                    # http://localhost:8501
 ```
 
-The Attention paper is pre-loaded and the Qdrant index ships with the repo, so `make app` works out of the box. `make help` lists the rest.
+Two PDFs are pre-loaded and the Qdrant index ships with the repo, so `make app` works out of the box. `make help` lists the rest.
 
 ## Build log
 
@@ -49,16 +51,17 @@ The Attention paper is pre-loaded and the Qdrant index ships with the repo, so `
 | | |
 |---|---|
 | LLM | Gemini 2.5 Flash · Groq Llama 3.x · Ollama |
-| Embeddings | `BAAI/bge-small-en-v1.5` (local, 384-dim) |
-| Reranker | `BAAI/bge-reranker-v2-m3` (local) |
+| Embeddings | `BAAI/bge-small-en-v1.5` via Hugging Face `sentence-transformers` (local, 384-dim) |
+| Reranker | `BAAI/bge-reranker-v2-m3` via Hugging Face (local, cross-encoder) |
 | Vector store | Qdrant (embedded, persistent) |
 | PDF | Docling (layout) + pdfplumber (text-only + OCR check) |
 | Tracing | Arize Phoenix / OpenTelemetry |
+| Evals | RAGAS (via LangChain wrappers) |
 | UI | Streamlit |
 
-No LangChain / LlamaIndex — orchestration is hand-written across 6 files.
+Chat orchestration is hand-written across 6 files so the data flow is visible end-to-end.
 
-## Repo layout
+## Layout
 
 ```
 app.py            Streamlit UI

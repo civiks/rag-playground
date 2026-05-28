@@ -83,6 +83,16 @@ def _call_gemini(prompt: str, model_id: str, temperature: float, system: str | N
     )
 
 
+def _GROQ_HEADERS(api_key: str) -> dict[str, str]:
+    # Cloudflare WAF (error 1010) blocks urllib's default "Python-urllib/X" User-Agent.
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "rag-playground/0.1 (+https://github.com/civiks/rag-playground)",
+    }
+
+
 def _call_groq(prompt: str, model_id: str, temperature: float, system: str | None) -> tuple[str, int, int]:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -99,7 +109,7 @@ def _call_groq(prompt: str, model_id: str, temperature: float, system: str | Non
     req = urlreq.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers=_GROQ_HEADERS(api_key),
     )
     try:
         data = json.loads(urlreq.urlopen(req, timeout=60).read())
@@ -187,7 +197,7 @@ def _stream_groq(prompt: str, model_id: str, temperature: float, system: str | N
     req = urlreq.Request(
         "https://api.groq.com/openai/v1/chat/completions",
         data=body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers=_GROQ_HEADERS(api_key),
     )
     try:
         resp = urlreq.urlopen(req, timeout=60)
