@@ -32,6 +32,7 @@ MODE_OPTIONS = {
 CHUNKING_STRATEGIES = {
     "Naive (1200-char sliding)": "naive_1200",
     "Docling hybrid (structure-aware)": "docling_hybrid",
+    "Contextual (hybrid + LLM preambles)": "contextual",
 }
 
 RETRIEVAL_STRATEGIES = {

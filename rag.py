@@ -45,15 +45,25 @@ _tracer: trace.Tracer | None = None
 
 
 def _init_phoenix() -> trace.Tracer:
-    """Wire OTel to a Phoenix server (run `uv run phoenix serve` separately on :6006)."""
+    """Wire OTel to a Phoenix server (run `uv run phoenix serve` separately on :6006).
+
+    Set RAG_NO_TRACE=1 to skip Phoenix entirely (used by eval.py).
+    """
     global _initialized, _tracer
     if _initialized:
         return _tracer  # type: ignore[return-value]
 
+    if os.environ.get("RAG_NO_TRACE"):
+        _tracer = trace.get_tracer(__name__)
+        _initialized = True
+        return _tracer  # type: ignore[return-value]
+
+    import contextlib, io
     from phoenix.otel import register
 
     os.environ.setdefault("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
-    provider = register(project_name="rag-playground", auto_instrument=False)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        provider = register(project_name="rag-playground", auto_instrument=False)
     GoogleGenAIInstrumentor().instrument(tracer_provider=provider)
 
     _tracer = provider.get_tracer(__name__)

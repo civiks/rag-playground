@@ -8,9 +8,9 @@
 - [x] multi-provider llm: gemini / groq / ollama via `provider:model_id` dispatch
 - [x] chat ui: `st.chat_message`, last N turns threaded, streaming for all 3 providers, under-the-hood panel per response
 
-- [ ] adaptive agent: `classify_query` → `assess_retrieval` → `reflect_on_answer`, one retry max, `agent.*` phoenix spans
-- [ ] ragas eval: `eval_questions.json` + `eval.py` posting to phoenix experiments
-- [ ] contextual retrieval: llm-generated chunk preambles, prepended pre-embed and pre-bm25, cached by `sha1(chunk)`
+- [x] adaptive agent: `classify_query` → `assess_retrieval` → `reflect_on_answer`, one retry max, `agent.*` phoenix spans
+- [x] ragas eval: `eval_questions.json` + `eval.py`, faithfulness / answer_relevancy / context_precision via ragas 0.3.x
+- [x] contextual retrieval: llm-generated preamble per hybrid chunk, prepended pre-embed, cached by `sha1(chunk)`, `rag_contextual` collection
 
 - [ ] shave off latency
 - [ ] ingestion
