@@ -112,7 +112,7 @@ def _get_plain_text(_data: bytes, ext: str) -> str:
     return text
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=4)
 def _ingest_strategy(
     combined_hash: str,
     chunking: str,
