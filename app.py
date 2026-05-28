@@ -86,103 +86,77 @@ def _escape(s: str) -> str:
              .replace('"', "&quot;"))
 
 
-def _chunk_one(_doc_bytes: bytes, ext: str, embedder) -> tuple[dict[str, list[str]], list[dict]]:
-    """Per-file: extract text and produce chunks per strategy.
-    """
+def _docling_parse_bytes(_data: bytes, ext: str) -> tuple[str, list[str]]:
+    from ingest import _get_docling_data
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+        f.write(_data)
+        tmp_path = f.name
+    return _get_docling_data(tmp_path, ext)
+
+
+def _get_plain_text(_data: bytes, ext: str) -> str:
     ext = ext.lower()
     from ingest import PLAIN_TEXT_EXTS
 
     if ext in PLAIN_TEXT_EXTS:
-        text = _doc_bytes.decode("utf-8", errors="replace")
-        if not text.strip():
-            raise RuntimeError(f"Uploaded {ext} file is empty.")
-        return {
-            "naive_1200": chunks_naive(text),
-            "semantic":   chunks_semantic(text, embedder),
-        }, chunks_parent_child(text)
-
-    try:
-        from docling.chunking import HybridChunker
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import AcceleratorDevice, AcceleratorOptions, PdfPipelineOptions
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from ingest import chunks_hybrid, EMBED_MODEL, HYBRID_MAX_TOKENS
-
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-            f.write(_doc_bytes)
-            tmp_path = f.name
-
-        if ext == ".pdf":
-            from ingest import _pdf_needs_ocr
-            opts = PdfPipelineOptions()
-            opts.do_ocr = _pdf_needs_ocr(io.BytesIO(_doc_bytes))
-            opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
-            converter = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-            )
-        else:
-            converter = DocumentConverter()
-
-        result = converter.convert(tmp_path)
-        doc = result.document
-        markdown = doc.export_to_markdown()
-        hybrid_chunks = chunks_hybrid(doc, HybridChunker(tokenizer=EMBED_MODEL, max_tokens=HYBRID_MAX_TOKENS))
-        return {
-            "naive_1200":   chunks_naive(markdown),
-            "semantic":     chunks_semantic(markdown, embedder),
-            "docling_hybrid": hybrid_chunks,
-        }, chunks_parent_child(markdown)
-    except Exception:
-        if ext != ".pdf":
-            raise
+        text = _data.decode("utf-8", errors="replace")
+    elif ext == ".pdf":
         import pdfplumber
-        with pdfplumber.open(io.BytesIO(_doc_bytes)) as _pdf:
-            text = "\n".join(p.extract_text() or "" for p in _pdf.pages)
-        if not text.strip():
-            raise RuntimeError("Could not extract text from the uploaded PDF. Try a text-based PDF.")
-        return {
-            "naive_1200": chunks_naive(text),
-            "semantic":   chunks_semantic(text, embedder),
-        }, chunks_parent_child(text)
+        with pdfplumber.open(io.BytesIO(_data)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    else:
+        markdown, _ = _docling_parse_bytes(_data, ext)
+        text = markdown
+    if not text.strip():
+        raise RuntimeError(f"Could not extract text from {ext} file.")
+    return text
 
 
 @st.cache_resource(show_spinner=False)
-def _ingest_files(combined_hash: str, _files_data: tuple[tuple[str, bytes], ...]) -> tuple[QdrantClient, set[str]]:
-    """Ingest N uploaded files into one shared in-memory Qdrant. Chunks from every
-    file land in the same per-strategy collection; `source` payload field preserves
-    which file each chunk came from so citations stay correct.
-
-    Cached by `combined_hash`
-    """
+def _ingest_strategy(
+    combined_hash: str,
+    chunking: str,
+    _files_data: tuple[tuple[str, bytes], ...],
+    _status=None,
+) -> QdrantClient:
     embedder = _get_embedder()
     dim = embedder.get_embedding_dimension()
     client = QdrantClient(":memory:")
 
-    pooled: dict[str, list[tuple[str, str]]] = {}
+    def _step(msg: str) -> None:
+        if _status is not None:
+            _status.update(label=msg)
+
+    pooled: list[tuple[str, str]] = []
     pooled_pc: list[tuple[str, dict]] = []
-    available: set[str] = set()
+    n_files = len(_files_data)
 
-    for name, data in _files_data:
+    for i, (name, data) in enumerate(_files_data, 1):
+        prefix = f"[{i}/{n_files}] {name}"
         ext = Path(name).suffix.lower()
-        strategies, pc_data = _chunk_one(data, ext, embedder)
-        for strat, chunks in strategies.items():
-            pooled.setdefault(strat, []).extend((name, c) for c in chunks)
-            available.add(strat)
-        pooled_pc.extend((name, d) for d in pc_data)
+        if chunking == "docling_hybrid":
+            _step(f"{prefix} — parsing layout with Docling")
+            _, hybrid_chunks = _docling_parse_bytes(data, ext)
+            pooled.extend((name, c) for c in hybrid_chunks)
+        elif chunking == "parent_child":
+            _step(f"{prefix} — extracting text")
+            text = _get_plain_text(data, ext)
+            pooled_pc.extend((name, d) for d in chunks_parent_child(text))
+        elif chunking == "semantic":
+            _step(f"{prefix} — extracting text")
+            text = _get_plain_text(data, ext)
+            _step(f"{prefix} — semantic split (per-sentence embeddings)")
+            pooled.extend((name, c) for c in chunks_semantic(text, embedder))
+        else:  # naive_1200
+            _step(f"{prefix} — extracting text")
+            text = _get_plain_text(data, ext)
+            pooled.extend((name, c) for c in chunks_naive(text))
 
-    for strategy, items in pooled.items():
-        col = f"upload_{strategy}"
-        client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
-        vecs = embedder.encode([t for _, t in items], normalize_embeddings=True, show_progress_bar=False)
-        client.upsert(col, points=[
-            PointStruct(id=i, vector=v.tolist(),
-                        payload={"text": t, "source": s, "chunk_idx": i})
-            for i, ((s, t), v) in enumerate(zip(items, vecs))
-        ])
+    col = f"upload_{chunking}"
+    client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
 
-    if pooled_pc:
-        col = "upload_parent_child"
-        client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
+    if chunking == "parent_child":
+        _step(f"Embedding {len(pooled_pc)} child chunks")
         vecs = embedder.encode([d["text"] for _, d in pooled_pc], normalize_embeddings=True, show_progress_bar=False)
         client.upsert(col, points=[
             PointStruct(id=i, vector=v.tolist(),
@@ -190,9 +164,16 @@ def _ingest_files(combined_hash: str, _files_data: tuple[tuple[str, bytes], ...]
                                  "source": s, "chunk_idx": i})
             for i, ((s, d), v) in enumerate(zip(pooled_pc, vecs))
         ])
-        available.add("parent_child")
+    else:
+        _step(f"Embedding {len(pooled)} chunks")
+        vecs = embedder.encode([c for _, c in pooled], normalize_embeddings=True, show_progress_bar=False)
+        client.upsert(col, points=[
+            PointStruct(id=i, vector=v.tolist(),
+                        payload={"text": c, "source": s, "chunk_idx": i})
+            for i, ((s, c), v) in enumerate(zip(pooled, vecs))
+        ])
 
-    return client, available
+    return client
 
 MODEL_OPTIONS = {
     "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
@@ -292,23 +273,15 @@ with st.sidebar:
             b"||".join(name.encode() + b":" + data for name, data in files_data)
         ).hexdigest()
         if st.session_state.get("upload_combined_hash") != combined_hash:
-            names_list = [n for n, _ in files_data]
-            label = names_list[0] if len(names_list) == 1 else f"{len(names_list)} files"
-            with st.status(f"Ingesting {label}… (cached after first run)"):
-                try:
-                    session_client, available_strategies = _ingest_files(combined_hash, files_data)
-                    st.session_state.upload_client = session_client
-                    st.session_state.upload_filenames = names_list
-                    st.session_state.upload_combined_hash = combined_hash
-                    st.session_state.upload_strategies = available_strategies
-                    st.session_state.history = []
-                    st.success(f"Ready — {len(available_strategies)} strategies available")
-                except Exception as e:
-                    st.error(str(e))
-                    for k in ("upload_client", "upload_filenames", "upload_combined_hash", "upload_strategies"):
-                        st.session_state.pop(k, None)
+            st.session_state.upload_files_data = files_data
+            st.session_state.upload_filenames = [n for n, _ in files_data]
+            st.session_state.upload_combined_hash = combined_hash
+            st.session_state.upload_built_strategies = set()
+            st.session_state.history = []
+            n = len(files_data)
+            st.success(f"Loaded {n} file{'s' if n != 1 else ''} — index builds when you ask.")
     elif "upload_combined_hash" in st.session_state:
-        for k in ("upload_client", "upload_filenames", "upload_combined_hash", "upload_strategies"):
+        for k in ("upload_files_data", "upload_filenames", "upload_combined_hash", "upload_built_strategies"):
             st.session_state.pop(k, None)
         st.session_state.history = []
 
@@ -507,17 +480,26 @@ if question:
         else None
     )
 
-    upload_client: QdrantClient | None = st.session_state.get("upload_client")
-    if upload_client:
-        available = st.session_state.get("upload_strategies", set())
-        if chunking in available:
-            active_collection = f"upload_{chunking}"
-            active_client = upload_client
+    files_data = st.session_state.get("upload_files_data")
+    combined_hash = st.session_state.get("upload_combined_hash")
+    if files_data and combined_hash:
+        active_chunking = chunking
+        if chunking == "contextual":
+            active_chunking = "docling_hybrid"
+            st.info("Contextual chunking only works on the pre-indexed corpus — using **docling_hybrid** for this upload.")
+        built: set = st.session_state.setdefault("upload_built_strategies", set())
+        if active_chunking not in built:
+            with st.status(f"Indexing for **{active_chunking}** (first time)…", expanded=True) as status:
+                try:
+                    active_client = _ingest_strategy(combined_hash, active_chunking, files_data, _status=status)
+                    status.update(label="Indexed", state="complete", expanded=False)
+                    built.add(active_chunking)
+                except Exception as e:
+                    status.update(label=str(e), state="error")
+                    st.stop()
         else:
-            fallback = "docling_hybrid" if "docling_hybrid" in available else "naive_1200"
-            active_collection = f"upload_{fallback}"
-            active_client = upload_client
-            st.info(f"'{chunking_label}' requires pre-indexed corpus — using {fallback} for this upload.")
+            active_client = _ingest_strategy(combined_hash, active_chunking, files_data)
+        active_collection = f"upload_{active_chunking}"
     else:
         active_collection = f"rag_{chunking}"
         active_client = None

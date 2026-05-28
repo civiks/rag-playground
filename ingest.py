@@ -86,12 +86,7 @@ def _extract_text_fast(pdf_path: str) -> str:
 
 def _get_docling_data(doc_path: str, ext: str | None = None) -> tuple[str, list[str]]:
     """Parse any Docling-supported document and return (markdown, hybrid_chunks).
-    Result is cached by file hash so Docling only runs once per unique file.
-
-    PDF gets a tuned pipeline (OCR pre-check + CPU accelerator pin for Apple Silicon);
-    other formats use Docling defaults — DOCX/PPTX/HTML have no OCR step and images
-    use Docling's built-in OCR pipeline.
-    """
+    Cached by file hash so Docling runs once per unique file."""
     if ext is None:
         ext = Path(doc_path).suffix.lower()
     file_hash = hashlib.sha1(Path(doc_path).read_bytes()).hexdigest()
@@ -318,8 +313,6 @@ def main() -> None:
         ext = doc_path.suffix.lower()
         has_layout = ext not in PLAIN_TEXT_EXTS
 
-        # Get plain text for naive/semantic/parent_child. PDFs use the fast pdfplumber
-        # path; other Docling formats reuse the markdown export so we parse only once.
         markdown: str | None = None
         hybrid_chunks: list[str] | None = None
         if ext in PLAIN_TEXT_EXTS:
