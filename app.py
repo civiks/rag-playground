@@ -24,6 +24,11 @@ MODEL_OPTIONS = {
     "Ollama llama3.1:8b (local)": "ollama:llama3.1:8b",
 }
 
+MODE_OPTIONS = {
+    "Manual (you pick)": "manual",
+    "Auto (agent picks)": "auto",
+}
+
 CHUNKING_STRATEGIES = {
     "Naive (1200-char sliding)": "naive_1200",
     "Docling hybrid (structure-aware)": "docling_hybrid",
@@ -59,6 +64,14 @@ with st.sidebar:
     )
     model = MODEL_OPTIONS[model_label]
 
+    mode_label = st.radio(
+        "Mode",
+        list(MODE_OPTIONS.keys()),
+        help="Manual: you pick every knob. Auto: an agent classifies the question, picks retrieval / rerank / rewrite, gates on confidence, and self-critiques the answer.",
+    )
+    mode = MODE_OPTIONS[mode_label]
+    auto = mode == "auto"
+
     chunking_label = st.selectbox(
         "Chunking",
         list(CHUNKING_STRATEGIES.keys()),
@@ -69,21 +82,24 @@ with st.sidebar:
     retrieval_label = st.selectbox(
         "Retrieval",
         list(RETRIEVAL_STRATEGIES.keys()),
-        help="Dense uses cosine on embeddings. Hybrid adds BM25 (keyword) and fuses via Reciprocal Rank Fusion.",
+        disabled=auto,
+        help="Dense uses cosine on embeddings. Hybrid adds BM25 (keyword) and fuses via Reciprocal Rank Fusion. (Auto mode picks for you.)",
     )
     retrieval = RETRIEVAL_STRATEGIES[retrieval_label]
 
     rerank_label = st.selectbox(
         "Reranking",
         list(RERANK_OPTIONS.keys()),
-        help="Cross-encoder rescores (query, chunk) pairs jointly. Catches relevance failures BM25/dense miss.",
+        disabled=auto,
+        help="Cross-encoder rescores (query, chunk) pairs jointly. Catches relevance failures BM25/dense miss. (Auto mode picks for you.)",
     )
     rerank = RERANK_OPTIONS[rerank_label]
 
     rewrite_label = st.selectbox(
         "Query rewriting",
         list(REWRITE_OPTIONS.keys()),
-        help="HyDE: LLM writes a hypothetical answer and embeds that. Multi-query: 3 paraphrases, RRF-fused.",
+        disabled=auto,
+        help="HyDE: LLM writes a hypothetical answer and embeds that. Multi-query: 3 paraphrases, RRF-fused. (Auto mode picks for you.)",
     )
     rewrite = REWRITE_OPTIONS[rewrite_label]
 
@@ -123,19 +139,43 @@ def _render_details(entry: dict) -> None:
     n_hits = len(meta.hits)
     max_score = max((h.score for h in meta.hits), default=0.0)
 
+    auto_tag = " · **auto**" if entry.get("mode") == "auto" else ""
     summary = (
         f"{n_hits} chunks retrieved · {n_cited} cited · "
         f"{entry['latency_s']:.2f}s · {entry['input_tokens']}+{entry['output_tokens']} tok"
+        f"{auto_tag}"
     )
     with st.expander(summary):
         st.markdown(
             f"**Model:** `{entry['model_label']}`  &nbsp;·&nbsp;  "
             f"**Chunking:** `{entry['chunking_label']}`  &nbsp;·&nbsp;  "
-            f"**Retrieval:** `{entry['retrieval_label']}`  &nbsp;·&nbsp;  "
-            f"**Rerank:** `{entry['rerank_label']}`  &nbsp;·&nbsp;  "
-            f"**Rewrite:** `{entry['rewrite_label']}`  &nbsp;·&nbsp;  "
+            f"**Retrieval:** `{meta.strategy}`  &nbsp;·&nbsp;  "
+            f"**Rerank:** `{meta.rerank}`  &nbsp;·&nbsp;  "
+            f"**Rewrite:** `{meta.rewrite}`  &nbsp;·&nbsp;  "
             f"**k:** `{k_used}`"
         )
+
+        decision = entry.get("agent_decision")
+        if decision is not None:
+            st.markdown(
+                f"**Agent decided** &nbsp; retrieval=`{decision.retrieval}` · "
+                f"rerank=`{decision.rerank}` · rewrite=`{decision.rewrite}`"
+            )
+            if decision.reasoning:
+                st.caption(f"_Reasoning:_ {decision.reasoning}")
+
+        assessment = entry.get("agent_assessment")
+        if assessment is not None:
+            verdict = "OK" if assessment.ok else "weak"
+            tail = " → retried with stronger strategy" if entry.get("agent_retried") else ""
+            st.caption(f"_Assessment:_ {verdict} — {assessment.reason}{tail}")
+
+        reflection = entry.get("agent_reflection")
+        if reflection is not None:
+            faithful = reflection.get("faithful") if isinstance(reflection, dict) else reflection.faithful
+            critique = reflection.get("critique") if isinstance(reflection, dict) else reflection.critique
+            verdict = "faithful" if faithful else "unfaithful"
+            st.caption(f"_Self-critique:_ {verdict} — {critique}")
 
         if max_score < 0.4:
             st.error(
@@ -149,13 +189,15 @@ def _render_details(entry: dict) -> None:
                 st.markdown(f"- {rq}")
 
         st.markdown(f"##### Retrieved chunks (top {n_hits})")
-        for i, h in enumerate(meta.hits, start=1):
-            used = i in citations
-            badge = "**CITED**" if used else "_unused_"
-            st.markdown(
-                f"---\n**[{i}]** {badge}  ·  `{h.source}` chunk `{h.chunk_idx}`  ·  score `{h.score:.3f}`"
-            )
-            st.text(h.text)
+        tab_labels = [
+            f"[{i}] {'✓' if i in citations else '·'}" for i in range(1, n_hits + 1)
+        ]
+        for tab, (i, h) in zip(st.tabs(tab_labels), enumerate(meta.hits, start=1)):
+            with tab:
+                used = i in citations
+                badge = "**CITED**" if used else "_unused_"
+                st.caption(f"{badge}  ·  `{h.source}` chunk `{h.chunk_idx}`  ·  score `{h.score:.3f}`")
+                st.text(h.text)
 
 
 # Replay conversation history.
@@ -185,14 +227,15 @@ if question := st.chat_input("Ask a question about the corpus"):
     with st.chat_message("assistant"):
         usage_out: dict = {}
         try:
-            with st.spinner("Retrieving..."):
+            spinner_msg = "Agent thinking..." if auto else "Retrieving..."
+            with st.spinner(spinner_msg):
                 gen = answer_stream(
                     question, k=k, collection=f"rag_{chunking}", strategy=retrieval,
                     rerank=rerank, rewrite=rewrite, model=model,
-                    history=history_pairs, usage_out=usage_out,
+                    history=history_pairs, usage_out=usage_out, mode=mode,
                 )
-                meta = next(gen)              # retrieval/rerank/rewrite happen here
-            answer_text = st.write_stream(gen)  # then stream LLM tokens
+                meta = next(gen)              # classify/retrieve/assess (and maybe retry) happen here
+            answer_text = st.write_stream(gen)  # then stream LLM tokens; reflect runs after
         except RuntimeError as e:
             st.error(str(e))
             st.stop()
@@ -212,11 +255,16 @@ if question := st.chat_input("Ask a question about the corpus"):
             "rerank_label": rerank_label,
             "rewrite_label": rewrite_label,
             "k": k,
+            "mode": mode,
             "meta": meta,
             "latency_s": usage_out.get("latency_s", 0.0),
             "input_tokens": usage_out.get("input_tokens", 0),
             "output_tokens": usage_out.get("output_tokens", 0),
             "citations": citations,
+            "agent_decision": meta.agent_decision,
+            "agent_assessment": meta.agent_assessment,
+            "agent_retried": meta.agent_retried,
+            "agent_reflection": usage_out.get("agent_reflection"),
         }
         _render_details(entry)
 

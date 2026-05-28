@@ -8,14 +8,25 @@ os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
+import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Literal
 
 from dotenv import load_dotenv
 from openinference.instrumentation.google_genai import GoogleGenAIInstrumentor
 from opentelemetry import trace
 
+from agent import (
+    Assessment,
+    Reflection,
+    Strategy,
+    assess_retrieval,
+    classify_query,
+    reflect_on_answer,
+    stronger_strategy,
+)
 from generate import MODEL as DEFAULT_MODEL, Answer, generate, generate_stream, rewrite_to_hyde, rewrite_to_multi
 from retrieve import (
     DEFAULT_COLLECTION,
@@ -62,6 +73,11 @@ class RagResult:
     rewrite: str
     rewritten_queries: list[str]
     model: str
+    mode: str = "manual"
+    agent_decision: Strategy | None = None
+    agent_assessment: Assessment | None = None
+    agent_reflection: Reflection | None = None
+    agent_retried: bool = False
 
 
 @dataclass
@@ -75,6 +91,10 @@ class RetrievalMeta:
     rewrite: str
     rewritten_queries: list[str]
     model: str
+    mode: str = "manual"
+    agent_decision: Strategy | None = None
+    agent_assessment: Assessment | None = None
+    agent_retried: bool = False
 
 
 def _span_name(model: str, collection: str, strategy: str, rewrite: str, rerank: bool, k: int) -> str:
@@ -85,7 +105,7 @@ def _span_name(model: str, collection: str, strategy: str, rewrite: str, rerank:
     return f"rag.pipeline [{model_tag} · {chunking_tag} · {strategy} · rewrite={rewrite} · {rerank_tag} · k={k}]"
 
 
-def _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history) -> None:
+def _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode) -> None:
     span.set_attribute("openinference.span.kind", "CHAIN")
     span.set_attribute("input.value", question)
     span.set_attribute("retrieval.k", k)
@@ -94,8 +114,47 @@ def _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, mo
     span.set_attribute("retrieval.rerank", rerank)
     span.set_attribute("retrieval.rewrite", rewrite)
     span.set_attribute("llm.model_name", model)
+    span.set_attribute("rag.mode", mode)
     if history:
         span.set_attribute("chat.history.turns", len(history))
+
+
+def _agent_classify(tracer, question, model) -> Strategy:
+    with tracer.start_as_current_span("agent.classify") as span:
+        span.set_attribute("openinference.span.kind", "CHAIN")
+        span.set_attribute("input.value", question)
+        decision = classify_query(question, model=model)
+        span.set_attribute("output.value", json.dumps({
+            "retrieval": decision.retrieval, "rerank": decision.rerank,
+            "rewrite": decision.rewrite, "reasoning": decision.reasoning,
+        }))
+        return decision
+
+
+def _agent_assess(tracer, hits, strategy_obj) -> Assessment:
+    with tracer.start_as_current_span("agent.assess") as span:
+        span.set_attribute("openinference.span.kind", "CHAIN")
+        span.set_attribute("input.value", f"n_hits={len(hits)} top={hits[0].score if hits else 'n/a'}")
+        assessment = assess_retrieval(hits, strategy_obj)
+        retry_summary = (
+            f"{assessment.retry_strategy.retrieval}/rerank={assessment.retry_strategy.rerank}/rewrite={assessment.retry_strategy.rewrite}"
+            if assessment.retry_strategy else "exhausted"
+        )
+        span.set_attribute("output.value", json.dumps({
+            "ok": assessment.ok, "reason": assessment.reason, "retry": retry_summary,
+        }))
+        return assessment
+
+
+def _agent_reflect(tracer, question, answer_text, hits, model) -> Reflection:
+    with tracer.start_as_current_span("agent.reflect") as span:
+        span.set_attribute("openinference.span.kind", "CHAIN")
+        span.set_attribute("input.value", answer_text)
+        reflection = reflect_on_answer(question, answer_text, hits, model=model)
+        span.set_attribute("output.value", json.dumps({
+            "faithful": reflection.faithful, "critique": reflection.critique,
+        }))
+        return reflection
 
 
 def _run_retrieval(
@@ -192,14 +251,37 @@ def answer(
     rewrite: str = "off",
     model: str = DEFAULT_MODEL,
     history: list[tuple[str, str]] | None = None,
+    mode: Literal["manual", "auto"] = "manual",
 ) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
+
+    agent_decision: Strategy | None = None
+    agent_assessment: Assessment | None = None
+    agent_reflection: Reflection | None = None
+    agent_retried = False
+
     with tracer.start_as_current_span(_span_name(model, collection, strategy, rewrite, rerank, k)) as span:
-        _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history)
+        _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode)
+
+        if mode == "auto":
+            agent_decision = _agent_classify(tracer, question, model)
+            strategy, rerank, rewrite = agent_decision.retrieval, agent_decision.rerank, agent_decision.rewrite
+
         hits, rewritten_queries = _run_retrieval(
             tracer, question, k, collection, strategy, rerank, rewrite, model
         )
+
+        if mode == "auto":
+            current = Strategy(retrieval=strategy, rerank=rerank, rewrite=rewrite, reasoning="")
+            agent_assessment = _agent_assess(tracer, hits, current)
+            if (not agent_assessment.ok) and agent_assessment.retry_strategy is not None:
+                rs = agent_assessment.retry_strategy
+                strategy, rerank, rewrite = rs.retrieval, rs.rerank, rs.rewrite
+                hits, rewritten_queries = _run_retrieval(
+                    tracer, question, k, collection, strategy, rerank, rewrite, model
+                )
+                agent_retried = True
 
         with tracer.start_as_current_span("rag.generate") as g_span:
             g_span.set_attribute("openinference.span.kind", "CHAIN")
@@ -208,6 +290,24 @@ def answer(
             g_span.set_attribute("output.value", ans.text)
             g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
             g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
+
+        if mode == "auto" and not agent_retried:
+            agent_reflection = _agent_reflect(tracer, question, ans.text, hits, model)
+            if not agent_reflection.faithful:
+                stronger = stronger_strategy(Strategy(retrieval=strategy, rerank=rerank, rewrite=rewrite, reasoning=""))
+                if stronger is not None:
+                    strategy, rerank, rewrite = stronger.retrieval, stronger.rerank, stronger.rewrite
+                    hits, rewritten_queries = _run_retrieval(
+                        tracer, question, k, collection, strategy, rerank, rewrite, model
+                    )
+                    with tracer.start_as_current_span("rag.generate.retry") as g_span:
+                        g_span.set_attribute("openinference.span.kind", "CHAIN")
+                        g_span.set_attribute("input.value", question)
+                        ans = generate(question, hits, model=model, history=history)
+                        g_span.set_attribute("output.value", ans.text)
+                        g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
+                        g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
+                    agent_retried = True
 
         span.set_attribute("output.value", ans.text)
         span.set_attribute("citations.used", str(ans.citations_used))
@@ -219,6 +319,8 @@ def answer(
         question=question, answer=ans, hits=hits,
         latency_s=latency_s, collection=collection, strategy=strategy, rerank=rerank,
         rewrite=rewrite, rewritten_queries=rewritten_queries, model=model,
+        mode=mode, agent_decision=agent_decision, agent_assessment=agent_assessment,
+        agent_reflection=agent_reflection, agent_retried=agent_retried,
     )
 
 
@@ -232,6 +334,7 @@ def answer_stream(
     model: str = DEFAULT_MODEL,
     history: list[tuple[str, str]] | None = None,
     usage_out: dict | None = None,
+    mode: Literal["manual", "auto"] = "manual",
 ) -> Iterator:
     """Streaming variant. Yields a RetrievalMeta first, then token-delta strings.
 
@@ -240,22 +343,51 @@ def answer_stream(
         meta = next(gen)                  # render chunks panel from meta
         full_text = st.write_stream(gen)  # stream tokens into the chat message
         # After: usage_out has input_tokens, output_tokens, latency_s,
-        #        full_text, citations.
+        #        full_text, citations, agent_reflection (when mode="auto").
+
+    mode="auto" runs classify + assess + (one retrieval retry if weak) up front,
+    then streams. Reflect runs after the stream completes as advisory only — it
+    can't trigger a regen here without restarting the stream, so the critique
+    is logged to the trace + usage_out for the UI to surface. Use the
+    non-streaming `answer()` if you want reflect-driven regeneration.
     """
     if usage_out is None:
         usage_out = {}
     tracer = _init_phoenix()
     start = time.perf_counter()
+
+    agent_decision: Strategy | None = None
+    agent_assessment: Assessment | None = None
+    agent_retried = False
+
     with tracer.start_as_current_span(_span_name(model, collection, strategy, rewrite, rerank, k)) as span:
-        _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history)
+        _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode)
+
+        if mode == "auto":
+            agent_decision = _agent_classify(tracer, question, model)
+            strategy, rerank, rewrite = agent_decision.retrieval, agent_decision.rerank, agent_decision.rewrite
+
         hits, rewritten_queries = _run_retrieval(
             tracer, question, k, collection, strategy, rerank, rewrite, model
         )
+
+        if mode == "auto":
+            current = Strategy(retrieval=strategy, rerank=rerank, rewrite=rewrite, reasoning="")
+            agent_assessment = _agent_assess(tracer, hits, current)
+            if (not agent_assessment.ok) and agent_assessment.retry_strategy is not None:
+                rs = agent_assessment.retry_strategy
+                strategy, rerank, rewrite = rs.retrieval, rs.rerank, rs.rewrite
+                hits, rewritten_queries = _run_retrieval(
+                    tracer, question, k, collection, strategy, rerank, rewrite, model
+                )
+                agent_retried = True
 
         yield RetrievalMeta(
             question=question, hits=hits, collection=collection,
             strategy=strategy, rerank=rerank, rewrite=rewrite,
             rewritten_queries=rewritten_queries, model=model,
+            mode=mode, agent_decision=agent_decision,
+            agent_assessment=agent_assessment, agent_retried=agent_retried,
         )
 
         with tracer.start_as_current_span("rag.generate") as g_span:
@@ -270,6 +402,13 @@ def answer_stream(
             g_span.set_attribute("llm.token_count.completion", usage_out.get("output_tokens", 0))
 
         citations = [i for i in range(1, len(hits) + 1) if f"[{i}]" in full_text]
+
+        if mode == "auto":
+            reflection = _agent_reflect(tracer, question, full_text, hits, model)
+            usage_out["agent_reflection"] = {
+                "faithful": reflection.faithful, "critique": reflection.critique,
+            }
+
         span.set_attribute("output.value", full_text)
         span.set_attribute("citations.used", str(citations))
         span.set_attribute("llm.token_count.prompt", usage_out.get("input_tokens", 0))

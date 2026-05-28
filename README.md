@@ -1,10 +1,8 @@
-# rag-playground
-
-A playground for experimenting with RAG techniques.
+> A playground for experimenting with RAG techniques.
 
 ## Stack
 
-LLM: Gemini · Groq · Ollama (selectable in UI) &nbsp;·&nbsp;
+LLM: Gemini · Groq · Ollama &nbsp;·&nbsp;
 Embeddings: `BAAI/bge-small-en-v1.5` (local) &nbsp;·&nbsp;
 Reranker: `BAAI/bge-reranker-v2-m3` (local) &nbsp;·&nbsp;
 Vector store: Qdrant (local, embedded) &nbsp;·&nbsp;
@@ -28,6 +26,5 @@ uv run streamlit run app.py             # app on http://localhost:8501
 - **Groq** (free, separate quota bucket) — `GROQ_API_KEY` from https://console.groq.com/keys
 - **Ollama** (local, no key) — `brew install ollama && ollama pull llama3.1:8b && ollama serve`
 
-## What's in / what's next
 
-See [TODO.md](./TODO.md).
+[TODO.md](./TODO.md) · [queries.md](./queries.md)
