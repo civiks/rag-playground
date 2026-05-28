@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+from pathlib import Path
 
 import streamlit as st
 from qdrant_client import QdrantClient
@@ -85,14 +86,20 @@ def _escape(s: str) -> str:
              .replace('"', "&quot;"))
 
 
-@st.cache_resource(show_spinner=False)
-def _ingest_full(pdf_hash: str, _pdf_bytes: bytes) -> tuple[QdrantClient, set[str]]:
-    """Cached by sha1(pdf_bytes) — same file never re-ingested across sessions."""
-    embedder = _get_embedder()
-    dim = embedder.get_embedding_dimension()
-    client = QdrantClient(":memory:")
-    strategies: dict[str, list] = {}
-    pc_data: list[dict] = []
+def _chunk_one(_doc_bytes: bytes, ext: str, embedder) -> tuple[dict[str, list[str]], list[dict]]:
+    """Per-file: extract text and produce chunks per strategy.
+    """
+    ext = ext.lower()
+    from ingest import PLAIN_TEXT_EXTS
+
+    if ext in PLAIN_TEXT_EXTS:
+        text = _doc_bytes.decode("utf-8", errors="replace")
+        if not text.strip():
+            raise RuntimeError(f"Uploaded {ext} file is empty.")
+        return {
+            "naive_1200": chunks_naive(text),
+            "semantic":   chunks_semantic(text, embedder),
+        }, chunks_parent_child(text)
 
     try:
         from docling.chunking import HybridChunker
@@ -101,61 +108,91 @@ def _ingest_full(pdf_hash: str, _pdf_bytes: bytes) -> tuple[QdrantClient, set[st
         from docling.document_converter import DocumentConverter, PdfFormatOption
         from ingest import chunks_hybrid, EMBED_MODEL, HYBRID_MAX_TOKENS
 
-        from ingest import _pdf_needs_ocr
-        needs_ocr = _pdf_needs_ocr(io.BytesIO(_pdf_bytes))
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(_pdf_bytes)
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(_doc_bytes)
             tmp_path = f.name
-        opts = PdfPipelineOptions()
-        opts.do_ocr = needs_ocr
-        opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
-        result = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-        ).convert(tmp_path)
+
+        if ext == ".pdf":
+            from ingest import _pdf_needs_ocr
+            opts = PdfPipelineOptions()
+            opts.do_ocr = _pdf_needs_ocr(io.BytesIO(_doc_bytes))
+            opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
+            converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+            )
+        else:
+            converter = DocumentConverter()
+
+        result = converter.convert(tmp_path)
         doc = result.document
         markdown = doc.export_to_markdown()
         hybrid_chunks = chunks_hybrid(doc, HybridChunker(tokenizer=EMBED_MODEL, max_tokens=HYBRID_MAX_TOKENS))
-        strategies = {
+        return {
             "naive_1200":   chunks_naive(markdown),
             "semantic":     chunks_semantic(markdown, embedder),
             "docling_hybrid": hybrid_chunks,
-        }
-        pc_data = chunks_parent_child(markdown)
+        }, chunks_parent_child(markdown)
     except Exception:
+        if ext != ".pdf":
+            raise
         import pdfplumber
-        with pdfplumber.open(io.BytesIO(_pdf_bytes)) as _pdf:
+        with pdfplumber.open(io.BytesIO(_doc_bytes)) as _pdf:
             text = "\n".join(p.extract_text() or "" for p in _pdf.pages)
         if not text.strip():
             raise RuntimeError("Could not extract text from the uploaded PDF. Try a text-based PDF.")
-        strategies = {
+        return {
             "naive_1200": chunks_naive(text),
             "semantic":   chunks_semantic(text, embedder),
-        }
-        pc_data = chunks_parent_child(text)
+        }, chunks_parent_child(text)
 
-    for strategy, chunks in strategies.items():
+
+@st.cache_resource(show_spinner=False)
+def _ingest_files(combined_hash: str, _files_data: tuple[tuple[str, bytes], ...]) -> tuple[QdrantClient, set[str]]:
+    """Ingest N uploaded files into one shared in-memory Qdrant. Chunks from every
+    file land in the same per-strategy collection; `source` payload field preserves
+    which file each chunk came from so citations stay correct.
+
+    Cached by `combined_hash`
+    """
+    embedder = _get_embedder()
+    dim = embedder.get_embedding_dimension()
+    client = QdrantClient(":memory:")
+
+    pooled: dict[str, list[tuple[str, str]]] = {}
+    pooled_pc: list[tuple[str, dict]] = []
+    available: set[str] = set()
+
+    for name, data in _files_data:
+        ext = Path(name).suffix.lower()
+        strategies, pc_data = _chunk_one(data, ext, embedder)
+        for strat, chunks in strategies.items():
+            pooled.setdefault(strat, []).extend((name, c) for c in chunks)
+            available.add(strat)
+        pooled_pc.extend((name, d) for d in pc_data)
+
+    for strategy, items in pooled.items():
         col = f"upload_{strategy}"
         client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
-        vecs = embedder.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
+        vecs = embedder.encode([t for _, t in items], normalize_embeddings=True, show_progress_bar=False)
         client.upsert(col, points=[
             PointStruct(id=i, vector=v.tolist(),
-                        payload={"text": c, "source": "upload", "chunk_idx": i})
-            for i, (c, v) in enumerate(zip(chunks, vecs))
+                        payload={"text": t, "source": s, "chunk_idx": i})
+            for i, ((s, t), v) in enumerate(zip(items, vecs))
         ])
 
-    col = "upload_parent_child"
-    client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
-    child_texts = [d["text"] for d in pc_data]
-    vecs = embedder.encode(child_texts, normalize_embeddings=True, show_progress_bar=False)
-    client.upsert(col, points=[
-        PointStruct(id=i, vector=v.tolist(),
-                    payload={"text": d["text"], "parent_text": d["parent_text"],
-                             "source": "upload", "chunk_idx": i})
-        for i, (d, v) in enumerate(zip(pc_data, vecs))
-    ])
-    strategies["parent_child"] = []  # mark as available
+    if pooled_pc:
+        col = "upload_parent_child"
+        client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
+        vecs = embedder.encode([d["text"] for _, d in pooled_pc], normalize_embeddings=True, show_progress_bar=False)
+        client.upsert(col, points=[
+            PointStruct(id=i, vector=v.tolist(),
+                        payload={"text": d["text"], "parent_text": d["parent_text"],
+                                 "source": s, "chunk_idx": i})
+            for i, ((s, d), v) in enumerate(zip(pooled_pc, vecs))
+        ])
+        available.add("parent_child")
 
-    return client, set(strategies.keys()) | {"parent_child"}
+    return client, available
 
 MODEL_OPTIONS = {
     "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
@@ -166,8 +203,8 @@ MODEL_OPTIONS = {
 }
 
 MODE_OPTIONS = {
-    "Manual (you pick)": "manual",
-    "Auto (agent picks)": "auto",
+    "Manual": "manual",
+    "Auto (agentic)": "auto",
 }
 
 CHUNKING_STRATEGIES = {
@@ -194,13 +231,29 @@ REWRITE_OPTIONS = {
     "Multi-query (3 paraphrases)": "multi",
 }
 
+EXAMPLE_QUESTIONS_CORPUS = [
+    "What is multi-head attention?",
+    "How does YOLO frame object detection differently?",
+    "Compare the encoder and decoder stacks.",
+]
+
+EXAMPLE_QUESTIONS_UPLOAD = [
+    "Summarise this document.",
+    "What are the key takeaways?",
+    "List the main sections.",
+]
+
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
 st.title("RAG Playground")
-st.caption("Gemini · Groq · Ollama · BGE embeddings · Qdrant · Phoenix tracing")
 
-if st.session_state.get("upload_filename"):
-    st.info(f"Chatting with: **{st.session_state['upload_filename']}** (uploaded) — remove the file in the sidebar to switch back to the pre-loaded corpus.")
+upload_names: list[str] = st.session_state.get("upload_filenames", [])
+if upload_names:
+    if len(upload_names) == 1:
+        target_label = f"**{upload_names[0]}**"
+    else:
+        target_label = f"**{len(upload_names)} uploaded documents** ({', '.join(upload_names)})"
+    st.info(f"Chatting with: {target_label} — remove files in the sidebar to switch back to the pre-loaded corpus.")
 
 with st.sidebar:
     st.header("API Keys")
@@ -226,28 +279,37 @@ with st.sidebar:
         os.environ["GROQ_API_KEY"] = _groq_api_key
 
     st.divider()
-    st.header("PDF")
-    uploaded_file = st.file_uploader("Upload a PDF to chat with", type="pdf")
-    if uploaded_file is not None:
-        if st.session_state.get("upload_filename") != uploaded_file.name:
-            pdf_bytes = uploaded_file.read()
-            pdf_hash = hashlib.sha1(pdf_bytes).hexdigest()
-            with st.status(f"Ingesting {uploaded_file.name}… (cached after first run)"):
+    st.header("Documents")
+    uploaded_files = st.file_uploader(
+        "Upload document(s) to chat with",
+        type=["pdf", "docx", "pptx", "html", "htm", "md", "txt", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="Max 2 MB per file. PDF / DOCX / PPTX / HTML parsed with Docling. MD / TXT read directly. PNG / JPG run through OCR. Drop multiple files to chat across them.",
+    )
+    if uploaded_files:
+        files_data: tuple[tuple[str, bytes], ...] = tuple((f.name, f.read()) for f in uploaded_files)
+        combined_hash = hashlib.sha1(
+            b"||".join(name.encode() + b":" + data for name, data in files_data)
+        ).hexdigest()
+        if st.session_state.get("upload_combined_hash") != combined_hash:
+            names_list = [n for n, _ in files_data]
+            label = names_list[0] if len(names_list) == 1 else f"{len(names_list)} files"
+            with st.status(f"Ingesting {label}… (cached after first run)"):
                 try:
-                    session_client, available_strategies = _ingest_full(pdf_hash, pdf_bytes)
+                    session_client, available_strategies = _ingest_files(combined_hash, files_data)
                     st.session_state.upload_client = session_client
-                    st.session_state.upload_filename = uploaded_file.name
+                    st.session_state.upload_filenames = names_list
+                    st.session_state.upload_combined_hash = combined_hash
                     st.session_state.upload_strategies = available_strategies
                     st.session_state.history = []
                     st.success(f"Ready — {len(available_strategies)} strategies available")
                 except Exception as e:
                     st.error(str(e))
-                    st.session_state.pop("upload_client", None)
-                    st.session_state.pop("upload_filename", None)
-    elif "upload_filename" in st.session_state:
-        st.session_state.pop("upload_client", None)
-        st.session_state.pop("upload_filename", None)
-        st.session_state.pop("upload_strategies", None)
+                    for k in ("upload_client", "upload_filenames", "upload_combined_hash", "upload_strategies"):
+                        st.session_state.pop(k, None)
+    elif "upload_combined_hash" in st.session_state:
+        for k in ("upload_client", "upload_filenames", "upload_combined_hash", "upload_strategies"):
+            st.session_state.pop(k, None)
         st.session_state.history = []
 
     st.divider()
@@ -391,6 +453,34 @@ def _render_details(entry: dict) -> None:
                 st.text(h.text)
 
 
+def _render_empty_state() -> None:
+    has_upload = bool(st.session_state.get("upload_filenames"))
+    if has_upload:
+        names = st.session_state["upload_filenames"]
+        target = f"`{names[0]}`" if len(names) == 1 else f"your **{len(names)} documents**"
+        suggestions = EXAMPLE_QUESTIONS_UPLOAD
+    else:
+        target = "the pre-loaded papers"
+        suggestions = EXAMPLE_QUESTIONS_CORPUS
+
+    st.markdown(
+        f"<div style='text-align:center;padding:72px 0 20px;opacity:0.75;'>"
+        f"<div style='font-size:1.05em;'>Ask anything about {target}.</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(len(suggestions))
+    for col, q in zip(cols, suggestions):
+        with col:
+            if st.button(q, use_container_width=True, key=f"suggest_{hash(q)}"):
+                st.session_state["pending_question"] = q
+                st.rerun()
+
+
+if not st.session_state.history and not st.session_state.get("pending_question"):
+    _render_empty_state()
+
 for entry in st.session_state.history:
     with st.chat_message("user"):
         st.markdown(entry["question"])
@@ -406,7 +496,11 @@ for entry in st.session_state.history:
         _render_details(entry)
 
 
-if question := st.chat_input("Ask a question about your PDF"):
+question = st.chat_input("Ask a question about your documents")
+if not question and st.session_state.get("pending_question"):
+    question = st.session_state.pop("pending_question")
+
+if question:
     history_pairs = (
         [(e["question"], e["answer_text"]) for e in st.session_state.history[-history_turns:]]
         if history_turns > 0

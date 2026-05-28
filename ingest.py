@@ -1,8 +1,10 @@
 """
-Ingest pipeline: PDF -> Docling -> chunks (multiple strategies) -> embed -> Qdrant.
+Ingest pipeline: document -> Docling -> chunks (multiple strategies) -> embed -> Qdrant.
 
-Builds one Qdrant collection per chunking strategy in a single run, so the UI
-can swap strategies without re-ingesting.
+Supports PDF, DOCX, PPTX, HTML, MD, TXT, and images (PNG/JPG/JPEG) — Docling parses
+the structured formats, plain text files take a fast bypass. Builds one Qdrant
+collection per chunking strategy in a single run, so the UI can swap strategies
+without re-ingesting.
 
 Run: `uv run python ingest.py`
 """
@@ -47,6 +49,16 @@ CONTEXTUAL_MODEL = "ollama:llama3.1:8b"
 STRATEGIES = ["naive_1200", "docling_hybrid", "contextual", "semantic", "parent_child"]
 DOCLING_STRATEGIES = {"docling_hybrid", "contextual"}
 
+INPUT_FORMAT_BY_EXT = {
+    ".pdf":  InputFormat.PDF,
+    ".docx": InputFormat.DOCX,
+    ".pptx": InputFormat.PPTX,
+    ".html": InputFormat.HTML, ".htm": InputFormat.HTML,
+    ".png":  InputFormat.IMAGE, ".jpg": InputFormat.IMAGE, ".jpeg": InputFormat.IMAGE,
+}
+PLAIN_TEXT_EXTS = {".txt", ".md"}
+SUPPORTED_EXTS = set(INPUT_FORMAT_BY_EXT) | PLAIN_TEXT_EXTS
+
 
 def _pdf_needs_ocr(pdf_source) -> bool:
     """True if the PDF looks scanned: average extractable text per page is very low.
@@ -72,11 +84,17 @@ def _extract_text_fast(pdf_path: str) -> str:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
 
-def _get_docling_data(pdf_path: str) -> tuple[str, list[str]]:
-    """Parse with Docling and return (markdown, hybrid_chunks).
-    Result is cached by file hash so Docling only runs once per unique PDF.
+def _get_docling_data(doc_path: str, ext: str | None = None) -> tuple[str, list[str]]:
+    """Parse any Docling-supported document and return (markdown, hybrid_chunks).
+    Result is cached by file hash so Docling only runs once per unique file.
+
+    PDF gets a tuned pipeline (OCR pre-check + CPU accelerator pin for Apple Silicon);
+    other formats use Docling defaults — DOCX/PPTX/HTML have no OCR step and images
+    use Docling's built-in OCR pipeline.
     """
-    file_hash = hashlib.sha1(Path(pdf_path).read_bytes()).hexdigest()
+    if ext is None:
+        ext = Path(doc_path).suffix.lower()
+    file_hash = hashlib.sha1(Path(doc_path).read_bytes()).hexdigest()
     cache_file = DOCLING_CACHE_DIR / f"{file_hash}.json"
 
     if cache_file.exists():
@@ -84,13 +102,18 @@ def _get_docling_data(pdf_path: str) -> tuple[str, list[str]]:
         print(f"  [docling] using cached parse ({file_hash[:8]})")
         return cached["markdown"], cached["hybrid_chunks"]
 
-    print(f"  [docling] parsing (first time — will be cached after this)")
-    opts = PdfPipelineOptions()
-    opts.do_ocr = _pdf_needs_ocr(pdf_path)
-    opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
-    result = DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-    ).convert(pdf_path)
+    print(f"  [docling] parsing {ext} (first time — will be cached after this)")
+    if ext == ".pdf":
+        opts = PdfPipelineOptions()
+        opts.do_ocr = _pdf_needs_ocr(doc_path)
+        opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
+        converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        )
+    else:
+        converter = DocumentConverter()
+
+    result = converter.convert(doc_path)
 
     doc = result.document
     markdown = doc.export_to_markdown()
@@ -267,11 +290,11 @@ def main() -> None:
 
     QDRANT_PATH.mkdir(parents=True, exist_ok=True)
 
-    pdfs = sorted(CORPUS_DIR.glob("*.pdf"))
-    if not pdfs:
-        print(f"No PDFs found in {CORPUS_DIR}. Drop some in and re-run.")
+    docs = sorted(p for p in CORPUS_DIR.glob("*") if p.suffix.lower() in SUPPORTED_EXTS)
+    if not docs:
+        print(f"No supported documents in {CORPUS_DIR}. Supported: {sorted(SUPPORTED_EXTS)}")
         sys.exit(1)
-    print(f"Found {len(pdfs)} PDF(s) in corpus/")
+    print(f"Found {len(docs)} document(s) in corpus/")
 
     embedder = SentenceTransformer(EMBED_MODEL)
     dim = embedder.get_embedding_dimension()
@@ -290,11 +313,22 @@ def main() -> None:
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
 
-    for pdf in pdfs:
-        print(f"\nIngesting {pdf.name} ...")
-        needs_docling = bool(DOCLING_STRATEGIES & set(active_strategies))
+    for doc_path in docs:
+        print(f"\nIngesting {doc_path.name} ...")
+        ext = doc_path.suffix.lower()
+        has_layout = ext not in PLAIN_TEXT_EXTS
 
-        fast_text = _extract_text_fast(str(pdf))
+        # Get plain text for naive/semantic/parent_child. PDFs use the fast pdfplumber
+        # path; other Docling formats reuse the markdown export so we parse only once.
+        markdown: str | None = None
+        hybrid_chunks: list[str] | None = None
+        if ext in PLAIN_TEXT_EXTS:
+            fast_text = doc_path.read_text(encoding="utf-8", errors="replace")
+        elif ext == ".pdf":
+            fast_text = _extract_text_fast(str(doc_path))
+        else:
+            markdown, hybrid_chunks = _get_docling_data(str(doc_path), ext)
+            fast_text = markdown
 
         per_strategy: dict[str, list[str]] = {}
         if "naive_1200" in active_strategies:
@@ -303,13 +337,17 @@ def main() -> None:
             print(f"  [semantic] splitting on embedding similarity ...")
             per_strategy["semantic"] = chunks_semantic(fast_text, embedder)
 
-        if needs_docling:
-            markdown, hybrid_chunks = _get_docling_data(str(pdf))
+        layout_strategies = DOCLING_STRATEGIES & set(active_strategies)
+        if layout_strategies and has_layout:
+            if hybrid_chunks is None:
+                markdown, hybrid_chunks = _get_docling_data(str(doc_path), ext)
             if "docling_hybrid" in active_strategies:
                 per_strategy["docling_hybrid"] = hybrid_chunks
             if "contextual" in active_strategies:
                 print(f"  [contextual] generating preambles via {args.contextual_model} ...")
                 per_strategy["contextual"] = chunks_contextual(hybrid_chunks, markdown, args.contextual_model)
+        elif layout_strategies and not has_layout:
+            print(f"  [skip] {sorted(layout_strategies)} — {ext} has no layout to extract")
 
         for strategy, chunks in per_strategy.items():
             collection = f"rag_{strategy}"
@@ -317,9 +355,9 @@ def main() -> None:
             vectors = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
             client.upsert(collection_name=collection, points=[
                 PointStruct(
-                    id=stable_id(strategy, pdf.name, i),
+                    id=stable_id(strategy, doc_path.name, i),
                     vector=vec.tolist(),
-                    payload={"source": pdf.name, "chunk_idx": i, "text": chunk, "strategy": strategy},
+                    payload={"source": doc_path.name, "chunk_idx": i, "text": chunk, "strategy": strategy},
                 )
                 for i, (chunk, vec) in enumerate(zip(chunks, vectors))
             ])
@@ -330,9 +368,9 @@ def main() -> None:
             vectors = embedder.encode([d["text"] for d in pc_data], show_progress_bar=False, normalize_embeddings=True)
             client.upsert(collection_name="rag_parent_child", points=[
                 PointStruct(
-                    id=stable_id("parent_child", pdf.name, i),
+                    id=stable_id("parent_child", doc_path.name, i),
                     vector=vec.tolist(),
-                    payload={"source": pdf.name, "chunk_idx": i, "text": d["text"],
+                    payload={"source": doc_path.name, "chunk_idx": i, "text": d["text"],
                              "parent_text": d["parent_text"], "strategy": "parent_child"},
                 )
                 for i, (d, vec) in enumerate(zip(pc_data, vectors))
