@@ -31,6 +31,12 @@ RERANK_OPTIONS = {
     "BGE reranker v2-m3": True,
 }
 
+REWRITE_OPTIONS = {
+    "Off": "off",
+    "HyDE (hypothetical answer)": "hyde",
+    "Multi-query (3 paraphrases)": "multi",
+}
+
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
 st.title("RAG Playground")
@@ -59,6 +65,13 @@ with st.sidebar:
     )
     rerank = RERANK_OPTIONS[rerank_label]
 
+    rewrite_label = st.selectbox(
+        "Query rewriting",
+        list(REWRITE_OPTIONS.keys()),
+        help="HyDE: LLM writes a hypothetical answer and embeds that instead of the question. Multi-query: LLM produces 3 paraphrases, retrieve for each, RRF-fuse.",
+    )
+    rewrite = REWRITE_OPTIONS[rewrite_label]
+
     st.divider()
     st.header("Knobs")
     k = st.slider("Top-k chunks to retrieve", min_value=1, max_value=15, value=5)
@@ -85,12 +98,14 @@ if "history" not in st.session_state:
 if submitted and question:
     with st.spinner("Retrieving + generating ..."):
         result = answer(
-            question, k=k, collection=f"rag_{chunking}", strategy=retrieval, rerank=rerank,
+            question, k=k, collection=f"rag_{chunking}", strategy=retrieval,
+            rerank=rerank, rewrite=rewrite,
         )
     st.session_state.history.insert(0, {
         "chunking_label": chunking_label,
         "retrieval_label": retrieval_label,
         "rerank_label": rerank_label,
+        "rewrite_label": rewrite_label,
         "k": k,
         "result": result,
     })
@@ -118,8 +133,14 @@ def _render(entry: dict) -> None:
             f"Chunking: {entry['chunking_label']} · "
             f"Retrieval: {entry['retrieval_label']} · "
             f"Rerank: {entry['rerank_label']} · "
+            f"Rewrite: {entry['rewrite_label']} · "
             f"k={k}"
         )
+
+        if result.rewritten_queries:
+            with st.expander(f"Rewritten queries ({result.rewrite})", expanded=False):
+                for rq in result.rewritten_queries:
+                    st.markdown(f"- {rq}")
 
     with col_b:
         st.subheader(f"Retrieved chunks (top {k})")
@@ -142,7 +163,8 @@ for idx, entry in enumerate(st.session_state.history):
     q_short = result.question if len(result.question) <= 70 else result.question[:67] + "..."
     header = (
         f"Q: {q_short}  ·  "
-        f"{entry['chunking_label']} / {entry['retrieval_label']} / rerank={entry['rerank_label']}  ·  "
+        f"{entry['chunking_label']} / {entry['retrieval_label']} / "
+        f"rerank={entry['rerank_label']} / rewrite={entry['rewrite_label']}  ·  "
         f"k={entry['k']}  ·  "
         f"{result.latency_s:.2f}s  ·  "
         f"{result.answer.input_tokens}+{result.answer.output_tokens} tok"

@@ -109,7 +109,7 @@ def _retrieve_bm25(query: str, k: int, collection: str) -> list[Hit]:
     ]
 
 
-def _rrf_fuse(rankings: list[list[Hit]], k: int) -> list[Hit]:
+def rrf_fuse(rankings: list[list[Hit]], k: int) -> list[Hit]:
     """Reciprocal Rank Fusion: 1 / (RRF_K + rank), summed across rankings."""
     scores: dict[tuple[str, int], float] = {}
     items: dict[tuple[str, int], Hit] = {}
@@ -130,7 +130,7 @@ def retrieve(query: str, k: int = 5, collection: str = DEFAULT_COLLECTION, strat
     if strategy == "hybrid":
         dense = _retrieve_dense(query, k=PREFETCH_N, collection=collection)
         bm25 = _retrieve_bm25(query, k=PREFETCH_N, collection=collection)
-        return _rrf_fuse([dense, bm25], k=k)
+        return rrf_fuse([dense, bm25], k=k)
     return _retrieve_dense(query, k=k, collection=collection)
 
 

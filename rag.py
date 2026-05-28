@@ -17,8 +17,16 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-from generate import Answer, generate
-from retrieve import DEFAULT_COLLECTION, PREFETCH_N, RERANKER_MODEL, Hit, rerank_hits, retrieve
+from generate import Answer, generate, rewrite_to_hyde, rewrite_to_multi
+from retrieve import (
+    DEFAULT_COLLECTION,
+    PREFETCH_N,
+    RERANKER_MODEL,
+    Hit,
+    rerank_hits,
+    retrieve,
+    rrf_fuse,
+)
 
 load_dotenv()
 
@@ -52,6 +60,8 @@ class RagResult:
     collection: str
     strategy: str
     rerank: bool
+    rewrite: str
+    rewritten_queries: list[str]
 
 
 def answer(
@@ -60,15 +70,14 @@ def answer(
     collection: str = DEFAULT_COLLECTION,
     strategy: str = "dense",
     rerank: bool = False,
+    rewrite: str = "off",
 ) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
     fetch_k = PREFETCH_N if rerank else k
-    # Encode the config in the span name so the Phoenix trace list is scannable
-    # at a glance instead of every row reading "rag.pipeline".
     chunking_tag = collection.removeprefix("rag_")
     rerank_tag = "rerank" if rerank else "norerank"
-    span_name = f"rag.pipeline [{chunking_tag} · {strategy} · {rerank_tag} · k={k}]"
+    span_name = f"rag.pipeline [{chunking_tag} · {strategy} · rewrite={rewrite} · {rerank_tag} · k={k}]"
     with tracer.start_as_current_span(span_name) as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", question)
@@ -76,13 +85,47 @@ def answer(
         span.set_attribute("retrieval.collection", collection)
         span.set_attribute("retrieval.strategy", strategy)
         span.set_attribute("retrieval.rerank", rerank)
+        span.set_attribute("retrieval.rewrite", rewrite)
 
+        # 1. Optional query rewriting — LLM transforms the question before retrieval.
+        retrieval_queries: list[str]
+        rewritten_queries: list[str] = []
+        if rewrite == "hyde":
+            with tracer.start_as_current_span("rag.rewrite") as rw_span:
+                rw_span.set_attribute("openinference.span.kind", "CHAIN")
+                rw_span.set_attribute("input.value", question)
+                rw_span.set_attribute("rewrite.strategy", "hyde")
+                hypothetical = rewrite_to_hyde(question)
+                rewritten_queries = [hypothetical]
+                rw_span.set_attribute("output.value", hypothetical)
+            retrieval_queries = [hypothetical]
+        elif rewrite == "multi":
+            with tracer.start_as_current_span("rag.rewrite") as rw_span:
+                rw_span.set_attribute("openinference.span.kind", "CHAIN")
+                rw_span.set_attribute("input.value", question)
+                rw_span.set_attribute("rewrite.strategy", "multi")
+                paraphrases = rewrite_to_multi(question, n=3)
+                rewritten_queries = paraphrases
+                rw_span.set_attribute("output.value", "\n".join(paraphrases))
+            retrieval_queries = [question, *paraphrases]
+        else:
+            retrieval_queries = [question]
+
+        # 2. Retrieve for each query; fuse if multiple.
         with tracer.start_as_current_span("rag.retrieve") as r_span:
             r_span.set_attribute("openinference.span.kind", "RETRIEVER")
             r_span.set_attribute("input.value", question)
             r_span.set_attribute("retrieval.collection", collection)
             r_span.set_attribute("retrieval.strategy", strategy)
-            hits = retrieve(question, k=fetch_k, collection=collection, strategy=strategy)
+            r_span.set_attribute("retrieval.query_count", len(retrieval_queries))
+            if len(retrieval_queries) == 1:
+                hits = retrieve(retrieval_queries[0], k=fetch_k, collection=collection, strategy=strategy)
+            else:
+                rankings = [
+                    retrieve(q, k=fetch_k, collection=collection, strategy=strategy)
+                    for q in retrieval_queries
+                ]
+                hits = rrf_fuse(rankings, k=fetch_k)
             r_span.set_attribute("retrieval.num_hits", len(hits))
             for i, h in enumerate(hits):
                 p = f"retrieval.documents.{i}.document"
@@ -132,6 +175,7 @@ def answer(
     return RagResult(
         question=question, answer=ans, hits=hits,
         latency_s=latency_s, collection=collection, strategy=strategy, rerank=rerank,
+        rewrite=rewrite, rewritten_queries=rewritten_queries,
     )
 
 
