@@ -5,11 +5,10 @@ Runs eval_questions.json through the RAG pipeline and scores with RAGAS metrics:
 
 Results are printed as a table and saved to data/eval/<config>.json.
 
-Usage:
-  uv run python eval.py
-  uv run python eval.py --chunking contextual --retrieval hybrid --rerank --rewrite multi
-  uv run python eval.py --chunking naive_1200 --retrieval dense --model groq:llama-3.3-70b-versatile
-  uv run python eval.py --type jargon   # only run jargon questions
+Usage (run from repo root so `from rag import answer` resolves):
+  PYTHONPATH=. uv run python evals/eval.py
+  PYTHONPATH=. uv run python evals/eval.py --chunking contextual --retrieval hybrid --rerank --rewrite multi
+  PYTHONPATH=. uv run python evals/eval.py --type jargon   # only run jargon questions
 """
 from __future__ import annotations
 
@@ -52,7 +51,7 @@ except ImportError as e:
 from rag import answer
 
 QUESTIONS_FILE = Path(__file__).parent / "eval_questions.json"
-RESULTS_DIR = Path(__file__).parent / "data" / "eval"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "data" / "eval"
 
 
 def _build_eval_llm(model: str = "ollama:llama3.1:8b"):

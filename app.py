@@ -160,7 +160,7 @@ REWRITE_OPTIONS = {
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
 st.title("RAG Playground")
-st.caption("Gemini · Groq · Ollama · BGE embeddings · Qdrant · Phoenix traces on :6006")
+st.caption("Gemini · Groq · Ollama · BGE embeddings · Qdrant · Phoenix tracing")
 
 if st.session_state.get("upload_filename"):
     st.info(f"Chatting with: **{st.session_state['upload_filename']}** (uploaded) — remove the file in the sidebar to switch back to the pre-loaded corpus.")

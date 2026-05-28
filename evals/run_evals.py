@@ -3,10 +3,10 @@
 Runs 4 configs from weakest to strongest, scores each with RAGAS,
 then prints a side-by-side table showing how each technique improves the numbers.
 
-Usage:
-    uv run python run_evals.py                          # default: ollama llama3.2:3b
-    uv run python run_evals.py --model ollama:llama3.1:8b --eval-model llama3.1:8b
-    uv run python run_evals.py --skip-pipeline          # re-score from existing data/eval/ JSONs
+Usage (run from repo root so `from eval import ...` resolves):
+    make eval                                                       # all configs
+    PYTHONPATH=. uv run python evals/run_evals.py --model ollama:llama3.1:8b
+    PYTHONPATH=. uv run python evals/run_evals.py --skip-pipeline   # re-score from saved JSONs
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ CONFIGS = [
     ),
 ]
 
-RESULTS_DIR = Path(__file__).parent / "data" / "eval"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "data" / "eval"
 QUESTIONS_FILE = Path(__file__).parent / "eval_questions.json"
 
 
