@@ -482,10 +482,15 @@ if question:
 
     files_data = st.session_state.get("upload_files_data")
     combined_hash = st.session_state.get("upload_combined_hash")
+    active_chunking = chunking
+    active_chunking_label = chunking_label
     if files_data and combined_hash:
-        active_chunking = chunking
         if chunking == "contextual":
             active_chunking = "docling_hybrid"
+            active_chunking_label = next(
+                (k for k, v in CHUNKING_STRATEGIES.items() if v == active_chunking),
+                active_chunking,
+            )
             st.info("Contextual chunking only works on the pre-indexed corpus — using **docling_hybrid** for this upload.")
         built: set = st.session_state.setdefault("upload_built_strategies", set())
         if active_chunking not in built:
@@ -540,7 +545,7 @@ if question:
             "question": question,
             "answer_text": answer_text,
             "model_label": model_label,
-            "chunking_label": chunking_label,
+            "chunking_label": active_chunking_label,
             "retrieval_label": retrieval_label,
             "rerank_label": rerank_label,
             "rewrite_label": rewrite_label,
