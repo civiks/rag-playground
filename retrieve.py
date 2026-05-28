@@ -12,8 +12,6 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 def _best_device() -> str:
-    """MPS on Apple Silicon, CUDA on Linux/Windows GPUs, else CPU. Both BGE models
-    run fine on MPS — unlike Docling's layout model, which hits float64 and crashes."""
     if torch.backends.mps.is_available():
         return "mps"
     if torch.cuda.is_available():
@@ -100,7 +98,8 @@ def _retrieve_dense(query: str, k: int, collection: str, client: QdrantClient | 
     vec = embedder.encode([query], normalize_embeddings=True)[0].tolist()
     res = c.query_points(collection_name=collection, query=vec, limit=k).points
     return [
-        Hit(text=p.payload["text"], source=p.payload["source"], chunk_idx=p.payload["chunk_idx"], score=p.score)
+        Hit(text=p.payload.get("parent_text", p.payload["text"]),
+            source=p.payload["source"], chunk_idx=p.payload["chunk_idx"], score=p.score)
         for p in res
     ]
 
@@ -110,7 +109,8 @@ def _retrieve_bm25(query: str, k: int, collection: str, client: QdrantClient | N
     scores = bm25.get_scores(_tokenize(query))
     top = sorted(range(len(payloads)), key=lambda i: -scores[i])[:k]
     return [
-        Hit(text=payloads[i]["text"], source=payloads[i]["source"], chunk_idx=payloads[i]["chunk_idx"], score=float(scores[i]))
+        Hit(text=payloads[i].get("parent_text", payloads[i]["text"]),
+            source=payloads[i]["source"], chunk_idx=payloads[i]["chunk_idx"], score=float(scores[i]))
         for i in top
     ]
 
@@ -147,12 +147,6 @@ def retrieve(
 
 
 def rerank_hits(query: str, hits: list[Hit], k: int) -> list[Hit]:
-    """Cross-encoder rescores (query, chunk) pairs jointly; returns top-k by relevance.
-
-    Unlike dense/BM25 which score query and chunk independently and then compare,
-    a cross-encoder feeds both into a transformer together — so it can model
-    fine-grained relevance ("does this chunk actually *answer* this question?").
-    """
     reranker = _get_reranker()
     pairs = [(query, h.text) for h in hits]
     scores = reranker.predict(pairs)

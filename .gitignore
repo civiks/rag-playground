@@ -15,6 +15,7 @@ wheels/
 # RAG playground local state
 data/eval/
 data/contextual_cache.json
+data/docling_cache/
 data/qdrant/.lock
 *.log
 

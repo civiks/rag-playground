@@ -1,26 +1,28 @@
 """Streamlit chat UI for the RAG pipeline. Run: `uv run streamlit run app.py`."""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
+import tempfile
 
 import streamlit as st
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from rag import answer_stream
-from retrieve import _get_client, _get_embedder, _get_reranker
+# from retrieve import _get_client, _get_embedder, _get_reranker
+from retrieve import _get_embedder
 
 
-@st.cache_resource(show_spinner="Loading models + vector DB")
-def _warm() -> bool:
-    _get_embedder()
-    _get_reranker()
-    _get_client()
-    return True
+# @st.cache_resource(show_spinner="Loading models + vector DB")
+# def _warm() -> bool:
+#     _get_embedder()
+#     _get_reranker()
+#     _get_client()
+#     return True
 
 
-_warm()
+# _warm()
 
 
 def _ingest_upload(pdf_bytes: bytes, embedder) -> QdrantClient:
@@ -49,19 +51,74 @@ def _ingest_upload(pdf_bytes: bytes, embedder) -> QdrantClient:
 
     vectors = embedder.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
 
+    embedder = _get_embedder()
+    dim = embedder.get_embedding_dimension()
     client = QdrantClient(":memory:")
-    client.create_collection(
-        "upload_session",
-        vectors_config=VectorParams(size=len(vectors[0]), distance=Distance.COSINE),
-    )
-    client.upsert(
-        "upload_session",
-        points=[
-            PointStruct(id=i, vector=vec.tolist(), payload={"text": chunk, "source": "upload", "chunk_idx": i})
-            for i, (chunk, vec) in enumerate(zip(chunks, vectors))
-        ],
-    )
-    return client
+    strategies: dict[str, list] = {}
+    pc_data: list[dict] = []
+
+    try:
+        from docling.chunking import HybridChunker
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import AcceleratorDevice, AcceleratorOptions, PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from ingest import chunks_hybrid, EMBED_MODEL, HYBRID_MAX_TOKENS
+
+        from ingest import _pdf_needs_ocr
+        needs_ocr = _pdf_needs_ocr(io.BytesIO(_pdf_bytes))
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(_pdf_bytes)
+            tmp_path = f.name
+        opts = PdfPipelineOptions()
+        opts.do_ocr = needs_ocr
+        opts.accelerator_options = AcceleratorOptions(device=AcceleratorDevice.CPU)
+        result = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        ).convert(tmp_path)
+        doc = result.document
+        markdown = doc.export_to_markdown()
+        hybrid_chunks = chunks_hybrid(doc, HybridChunker(tokenizer=EMBED_MODEL, max_tokens=HYBRID_MAX_TOKENS))
+        strategies = {
+            "naive_1200":   chunks_naive(markdown),
+            "semantic":     chunks_semantic(markdown, embedder),
+            "docling_hybrid": hybrid_chunks,
+        }
+        pc_data = chunks_parent_child(markdown)
+    except Exception:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(_pdf_bytes)) as _pdf:
+            text = "\n".join(p.extract_text() or "" for p in _pdf.pages)
+        if not text.strip():
+            raise RuntimeError("Could not extract text from the uploaded PDF. Try a text-based PDF.")
+        strategies = {
+            "naive_1200": chunks_naive(text),
+            "semantic":   chunks_semantic(text, embedder),
+        }
+        pc_data = chunks_parent_child(text)
+
+    for strategy, chunks in strategies.items():
+        col = f"upload_{strategy}"
+        client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
+        vecs = embedder.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
+        client.upsert(col, points=[
+            PointStruct(id=i, vector=v.tolist(),
+                        payload={"text": c, "source": "upload", "chunk_idx": i})
+            for i, (c, v) in enumerate(zip(chunks, vecs))
+        ])
+
+    col = "upload_parent_child"
+    client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
+    child_texts = [d["text"] for d in pc_data]
+    vecs = embedder.encode(child_texts, normalize_embeddings=True, show_progress_bar=False)
+    client.upsert(col, points=[
+        PointStruct(id=i, vector=v.tolist(),
+                    payload={"text": d["text"], "parent_text": d["parent_text"],
+                             "source": "upload", "chunk_idx": i})
+        for i, (d, v) in enumerate(zip(pc_data, vecs))
+    ])
+    strategies["parent_child"] = []  # mark as available
+
+    return client, set(strategies.keys()) | {"parent_child"}
 
 MODEL_OPTIONS = {
     "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
@@ -78,6 +135,8 @@ MODE_OPTIONS = {
 
 CHUNKING_STRATEGIES = {
     "Naive (1200-char sliding)": "naive_1200",
+    "Semantic (topic-shift splits)": "semantic",
+    "Parent-child (300-char index, 1200-char context)": "parent_child",
     "Docling hybrid (structure-aware)": "docling_hybrid",
     "Contextual (hybrid + LLM preambles)": "contextual",
 }
@@ -122,34 +181,34 @@ with st.sidebar:
         type="password",
         help="Free key from console.groq.com — needed only when a Groq model is selected.",
     )
-    # Runtime keys: prefer sidebar input, fall back to env var.
     _gemini_api_key: str | None = gemini_key_input.strip() or None
     _groq_api_key: str | None = groq_key_input.strip() or None
-    # Write Groq key back to env so the urllib-based Groq calls find it.
     if _groq_api_key:
         os.environ["GROQ_API_KEY"] = _groq_api_key
 
     st.divider()
     st.header("PDF")
     uploaded_file = st.file_uploader("Upload a PDF to chat with", type="pdf")
-    st.caption("Uses basic text extraction (pypdf). For structure-aware chunking, use the pre-loaded paper.")
     if uploaded_file is not None:
         if st.session_state.get("upload_filename") != uploaded_file.name:
-            with st.status(f"Ingesting {uploaded_file.name}…"):
+            pdf_bytes = uploaded_file.read()
+            pdf_hash = hashlib.sha1(pdf_bytes).hexdigest()
+            with st.status(f"Ingesting {uploaded_file.name}… (cached after first run)"):
                 try:
-                    session_client = _ingest_upload(uploaded_file.read(), _get_embedder())
+                    session_client, available_strategies = _ingest_full(pdf_hash, pdf_bytes)
                     st.session_state.upload_client = session_client
                     st.session_state.upload_filename = uploaded_file.name
+                    st.session_state.upload_strategies = available_strategies
                     st.session_state.history = []
-                    st.success(f"Ready — {uploaded_file.name}")
+                    st.success(f"Ready — {len(available_strategies)} strategies available")
                 except Exception as e:
                     st.error(str(e))
                     st.session_state.pop("upload_client", None)
                     st.session_state.pop("upload_filename", None)
     elif "upload_filename" in st.session_state:
-        # File was removed from the uploader — reset back to the pre-loaded corpus.
         st.session_state.pop("upload_client", None)
         st.session_state.pop("upload_filename", None)
+        st.session_state.pop("upload_strategies", None)
         st.session_state.history = []
 
     st.divider()
@@ -225,10 +284,6 @@ if "history" not in st.session_state:
 
 
 def _render_details(entry: dict) -> None:
-    """One collapsible 'under the hood' panel per assistant response — config,
-    rewritten queries (if any), and every retrieved chunk with its score + citation status.
-    Flat layout because Streamlit can't reliably nest expanders.
-    """
     meta = entry["meta"]
     citations = entry["citations"]
     k_used = entry["k"]
@@ -297,7 +352,6 @@ def _render_details(entry: dict) -> None:
                 st.text(h.text)
 
 
-# Replay conversation history.
 for entry in st.session_state.history:
     with st.chat_message("user"):
         st.markdown(entry["question"])
@@ -311,17 +365,26 @@ for entry in st.session_state.history:
 
 
 if question := st.chat_input("Ask a question about your PDF"):
-    # Thread the most-recent turns into the prompt as conversation context.
     history_pairs = (
         [(e["question"], e["answer_text"]) for e in st.session_state.history[-history_turns:]]
         if history_turns > 0
         else None
     )
 
-    # When a PDF is uploaded, use its in-memory collection; otherwise use the sidebar selection.
     upload_client: QdrantClient | None = st.session_state.get("upload_client")
-    active_collection = "upload_session" if upload_client else f"rag_{chunking}"
-    active_client = upload_client  # None → retrieve.py uses the global (cloud/local) client
+    if upload_client:
+        available = st.session_state.get("upload_strategies", set())
+        if chunking in available:
+            active_collection = f"upload_{chunking}"
+            active_client = upload_client
+        else:
+            fallback = "docling_hybrid" if "docling_hybrid" in available else "naive_1200"
+            active_collection = f"upload_{fallback}"
+            active_client = upload_client
+            st.info(f"'{chunking_label}' requires pre-indexed corpus — using {fallback} for this upload.")
+    else:
+        active_collection = f"rag_{chunking}"
+        active_client = None
 
     with st.chat_message("user"):
         st.markdown(question)
@@ -337,8 +400,8 @@ if question := st.chat_input("Ask a question about your PDF"):
                     history=history_pairs, usage_out=usage_out, mode=mode,
                     api_key=_gemini_api_key, client=active_client,
                 )
-                meta = next(gen)              # classify/retrieve/assess (and maybe retry) happen here
-            answer_text = st.write_stream(gen)  # then stream LLM tokens; reflect runs after
+                meta = next(gen)
+            answer_text = st.write_stream(gen)
         except RuntimeError as e:
             st.error(str(e))
             st.stop()

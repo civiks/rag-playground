@@ -19,5 +19,5 @@ dependencies = [
     "langchain-google-vertexai>=3.2.3",
     "langchain-ollama>=1.1.0",
     "langchain-groq>=1.1.2",
-    "pypdf>=4.0.0",
+    "pdfplumber>=0.11.9",
 ]
