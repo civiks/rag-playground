@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from urllib import error as urlerr
 from urllib import request as urlreq
@@ -148,11 +149,141 @@ def _dispatch(prompt: str, model: str, temperature: float, system: str | None = 
     raise ValueError(f"Unknown LLM provider: {provider!r} (model={model!r})")
 
 
+def _stream_gemini(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict) -> Iterator[str]:
+    client = _gemini_client_or_die()
+    cfg = (
+        types.GenerateContentConfig(temperature=temperature, system_instruction=system)
+        if system
+        else types.GenerateContentConfig(temperature=temperature)
+    )
+    for chunk in client.models.generate_content_stream(model=model_id, contents=prompt, config=cfg):
+        usage = getattr(chunk, "usage_metadata", None)
+        if usage:
+            usage_out["input_tokens"] = int(getattr(usage, "prompt_token_count", 0) or 0)
+            usage_out["output_tokens"] = int(getattr(usage, "candidates_token_count", 0) or 0)
+        text = getattr(chunk, "text", None)
+        if text:
+            yield text
+
+
+def _stream_groq(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict) -> Iterator[str]:
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Set GROQ_API_KEY in .env. Get a free key at https://console.groq.com/keys"
+        )
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    body = json.dumps({
+        "model": model_id, "messages": messages, "temperature": temperature,
+        "stream": True, "stream_options": {"include_usage": True},
+    }).encode()
+    req = urlreq.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        resp = urlreq.urlopen(req, timeout=60)
+    except urlerr.HTTPError as e:
+        raise RuntimeError(f"Groq stream failed ({e.code}): {e.read().decode(errors='ignore')}") from e
+    for raw in resp:
+        line = raw.decode("utf-8", errors="ignore").strip()
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        usage = obj.get("usage")
+        if usage:
+            usage_out["input_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
+            usage_out["output_tokens"] = int(usage.get("completion_tokens", 0) or 0)
+        choices = obj.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {}).get("content")
+        if delta:
+            yield delta
+
+
+def _stream_ollama(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict) -> Iterator[str]:
+    body: dict = {
+        "model": model_id, "prompt": prompt, "stream": True,
+        "options": {"temperature": temperature},
+    }
+    if system:
+        body["system"] = system
+    req = urlreq.Request(
+        "http://localhost:11434/api/generate",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urlreq.urlopen(req, timeout=180)
+    except (urlerr.URLError, urlerr.HTTPError) as e:
+        raise RuntimeError(
+            f"Ollama stream failed — is `ollama serve` running, and have you "
+            f"`ollama pull {model_id}`? ({e})"
+        ) from e
+    for raw in resp:
+        line = raw.decode("utf-8", errors="ignore").strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        chunk = obj.get("response")
+        if chunk:
+            yield chunk
+        if obj.get("done"):
+            usage_out["input_tokens"] = int(obj.get("prompt_eval_count", 0) or 0)
+            usage_out["output_tokens"] = int(obj.get("eval_count", 0) or 0)
+            break
+
+
+def _stream_dispatch(prompt: str, model: str, temperature: float, system: str | None = None, usage_out: dict | None = None) -> Iterator[str]:
+    if usage_out is None:
+        usage_out = {}
+    provider, model_id = _split_model(model)
+    if provider == "gemini":
+        yield from _stream_gemini(prompt, model_id, temperature, system, usage_out)
+    elif provider == "groq":
+        yield from _stream_groq(prompt, model_id, temperature, system, usage_out)
+    elif provider == "ollama":
+        yield from _stream_ollama(prompt, model_id, temperature, system, usage_out)
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider!r} (model={model!r})")
+
+
 def _format_context(hits: list[Hit]) -> str:
     blocks = []
     for i, h in enumerate(hits, start=1):
         blocks.append(f"[{i}] (source: {h.source}, chunk {h.chunk_idx}, score {h.score:.3f})\n{h.text}")
     return "\n\n---\n\n".join(blocks)
+
+
+def _build_prompt(question: str, context: str, history: list[tuple[str, str]] | None) -> str:
+    """Folds recent turns into the prompt so follow-up questions have context.
+
+    History goes into the user message (not system) so the system instruction
+    stays constant — keeps the "answer only from context" rule from drifting.
+    """
+    parts: list[str] = []
+    if history:
+        parts.append("Recent conversation (most recent last):\n")
+        for user_q, assistant_a in history[-4:]:
+            short_a = assistant_a if len(assistant_a) <= 600 else assistant_a[:600] + "…"
+            parts.append(f"User: {user_q}\nAssistant: {short_a}\n\n")
+        parts.append("---\n\n")
+    parts.append(f"Context:\n\n{context}\n\n---\n\nQuestion: {question}")
+    return "".join(parts)
 
 
 # Cache rewrites within a process: same question + same rewrite mode + same
@@ -202,12 +333,30 @@ def rewrite_to_multi(question: str, n: int = 3, model: str = MODEL) -> list[str]
     return lines
 
 
-def generate(question: str, hits: list[Hit], model: str = MODEL) -> Answer:
+def generate(
+    question: str,
+    hits: list[Hit],
+    model: str = MODEL,
+    history: list[tuple[str, str]] | None = None,
+) -> Answer:
     context = _format_context(hits)
-    prompt = f"Context:\n\n{context}\n\n---\n\nQuestion: {question}"
+    prompt = _build_prompt(question, context, history)
     text, in_tok, out_tok = _dispatch(prompt, model=model, temperature=0.2, system=SYSTEM)
     citations = [i for i in range(1, len(hits) + 1) if f"[{i}]" in text]
     return Answer(
         text=text, model=model, citations_used=citations,
         input_tokens=in_tok, output_tokens=out_tok,
     )
+
+
+def generate_stream(
+    question: str,
+    hits: list[Hit],
+    model: str = MODEL,
+    history: list[tuple[str, str]] | None = None,
+    usage_out: dict | None = None,
+) -> Iterator[str]:
+    """Stream token deltas. usage_out (if passed) is populated with token counts at end."""
+    context = _format_context(hits)
+    prompt = _build_prompt(question, context, history)
+    yield from _stream_dispatch(prompt, model=model, temperature=0.2, system=SYSTEM, usage_out=usage_out)
