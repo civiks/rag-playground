@@ -9,12 +9,13 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from rag import answer_stream
-from retrieve import _get_client, _get_embedder
+from retrieve import _get_client, _get_embedder, _get_reranker
 
 
-@st.cache_resource(show_spinner="Loading embedding model + vector DB")
+@st.cache_resource(show_spinner="Loading models + vector DB")
 def _warm() -> bool:
     _get_embedder()
+    _get_reranker()
     _get_client()
     return True
 
@@ -131,6 +132,7 @@ with st.sidebar:
     st.divider()
     st.header("PDF")
     uploaded_file = st.file_uploader("Upload a PDF to chat with", type="pdf")
+    st.caption("Uses basic text extraction (pypdf). For structure-aware chunking, use the pre-loaded paper.")
     if uploaded_file is not None:
         if st.session_state.get("upload_filename") != uploaded_file.name:
             with st.status(f"Ingesting {uploaded_file.name}…"):

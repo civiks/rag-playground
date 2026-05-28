@@ -13,7 +13,9 @@ wheels/
 .env
 
 # RAG playground local state
-data/
+data/eval/
+data/contextual_cache.json
+data/qdrant/.lock
 *.log
 
 # Phoenix
