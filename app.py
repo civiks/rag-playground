@@ -204,17 +204,19 @@ if st.session_state.get("upload_filename"):
 
 with st.sidebar:
     st.header("API Keys")
-    _env_gemini = os.environ.get("GOOGLE_API_KEY", "")
-    _env_groq = os.environ.get("GROQ_API_KEY", "")
+    # Inputs are intentionally blank — never pre-fill from os.environ, because on
+    # Streamlit Cloud env vars come from the deploy's Secrets and would leak to every
+    # visitor. Backend calls still read from os.environ, so `.env` (local) and properly
+    # set secrets continue to work — they're just not surfaced in the UI.
     gemini_key_input = st.text_input(
         "Gemini API key",
-        value=_env_gemini,
+        value="",
         type="password",
-        help="Free key from aistudio.google.com — never stored beyond this browser session.",
+        help="Free key from aistudio.google.com — kept only in this browser session.",
     )
     groq_key_input = st.text_input(
         "Groq API key (optional)",
-        value=_env_groq,
+        value="",
         type="password",
         help="Free key from console.groq.com — needed only when a Groq model is selected.",
     )

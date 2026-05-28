@@ -128,14 +128,28 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--skip-pipeline", action="store_true",
                         help="Skip running the pipeline; re-score from existing data/eval/ JSONs only")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Run only the first N questions (useful for rate-limited APIs)")
+    parser.add_argument("--configs", default=None,
+                        help="Comma-separated label substrings to filter CONFIGS (e.g. 'naive,hybrid · rerank')")
     args = parser.parse_args()
 
     questions = json.loads(QUESTIONS_FILE.read_text())
+    if args.limit:
+        questions = questions[:args.limit]
+        print(f"[limit] running on first {len(questions)} questions")
+
+    selected_configs = CONFIGS
+    if args.configs:
+        wanted = [s.strip() for s in args.configs.split(",") if s.strip()]
+        selected_configs = [c for c in CONFIGS if any(w in c["label"] for w in wanted)]
+        print(f"[configs] running {len(selected_configs)}/{len(CONFIGS)}: " +
+              ", ".join(c["label"] for c in selected_configs))
 
     rows: list[tuple[str, dict]] = []
     t_total = time.perf_counter()
 
-    for cfg in CONFIGS:
+    for cfg in selected_configs:
         if args.skip_pipeline:
             scores = _load_existing(cfg)
             if scores is None:

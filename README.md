@@ -1,6 +1,6 @@
 > A playground for experimenting with Retrieval-Augmented Generation (RAG) techniques.
 
-[Live demo](https://civiks-rag-playground.streamlit.app/)
+[Live demo](https://rag-playground-civiks.streamlit.app/)
 
 ![screenshot](docs/image.png)
 
@@ -20,46 +20,48 @@ Two PDFs are pre-loaded and the Qdrant index ships with the repo, so `make app` 
 
 ## Build log
 
-1. **Naive RAG.** Docling → 1200-char sliding chunks (200 overlap) → `bge-small-en-v1.5` → Qdrant cosine top-5 → stuff into Gemini. Works for "What is multi-head attention?", fails on anything paraphrased or jargon-heavy.
+1. **Naive RAG.** Docling → 1200-char chunks → BGE embeddings → Qdrant cosine top-5 → Gemini. Baseline.
+2. **Eval harness.** RAGAS over `evals/eval_questions.json` — faithfulness, answer relevancy, context precision.
+3. **Layout-aware chunking.** Docling `HybridChunker` respects headings and keeps tables intact. (`rag_docling_hybrid`)
+4. **Hybrid retrieval.** BM25 + dense vectors fused with Reciprocal Rank Fusion (k=60).
+5. **Cross-encoder rerank.** Retrieve top-20, rerank with `bge-reranker-v2-m3`, keep top-5.
+6. **Query rewriting.** HyDE (LLM writes a hypothetical answer, embeds *that*) and multi-query (3 paraphrases, union).
+7. **Multi-provider LLM.** Gemini, Groq, Ollama via `provider:model_id` dispatch. Streaming for all three.
+8. **Adaptive auto mode.** Three patterns from the literature:
+    - **Adaptive RAG** — `classify_query` picks retrieval / rerank / rewrite from question shape.
+    - **CRAG-style correction** — `assess_retrieval` gates on top score, retries with a stronger strategy.
+    - **Self-RAG-style reflection** — `reflect_on_answer` critiques final-answer faithfulness.
 
-2. **Eval harness.** Without numbers I can't tell whether a change helped. `evals/eval_questions.json` + RAGAS (faithfulness, answer relevancy, context precision). Gates every later change.
+    Every decision is its own Phoenix span.
+9. **Contextual retrieval.** LLM-generated preamble per chunk, prepended before embedding. (`rag_contextual`)
+10. **Semantic chunking.** Split where consecutive sentence embeddings drop in cosine (topic-shift).
+11. **Parent-child retrieval.** Index small children (~300 char), return the larger parent (~1200 char) to the LLM.
+12. **PDF upload.** Drag-and-drop, in-memory Qdrant per file, content-hash cached. OCR auto-detected per page.
 
-3. **Layout-aware chunking.** Fixed-size chunks split sentences mid-claim and lose section context. Swapped to Docling's `HybridChunker` — respects headings, keeps tables intact. New collection: `rag_docling_hybrid`.
+## Results
 
-4. **Hybrid retrieval.** Dense vectors miss rare technical terms ("scaled dot-product attention" tokenizes weirdly). Added BM25, fused with Reciprocal Rank Fusion (k=60). Both branches retrieve top-20, RRF picks top-k.
+RAGAS over `evals/eval_questions.json` (n=5, `llama-3.1-8b-instant` for both answering and scoring):
 
-5. **Cross-encoder rerank.** RRF's top-k is still noisy. Retrieve 20, rerank with `bge-reranker-v2-m3`, take 5. MPS/CUDA aware.
+| Config | Faithfulness | Answer Relevancy | Context Precision |
+|---|---|---|---|
+| naive · dense | 0.550 | 0.574 | 0.724 |
+| hybrid · rerank | 0.812 | 0.930 | 0.901 |
+| hybrid · rerank · multi-query | 0.844 | 0.938 | 0.868 |
+| contextual · hybrid · rerank · multi · auto | **1.000** | **0.921** | **0.983** |
 
-6. **Query rewriting.** Question wording rarely matches source phrasing.
-    - HyDE — LLM writes a hypothetical answer, embed *that*, retrieve against it.
-    - Multi-query — three paraphrases, union their retrieved sets.
-
-7. **Multi-provider LLM.** Gemini rate-limits hard on free tier. Added Groq (free, separate bucket) and Ollama (local). `provider:model_id` dispatch in `generate.py`, streaming for all three.
-
-8. **Adaptive agent.** Manual mode makes the user pick a strategy. Auto mode: an LLM classifies the query, picks retrieval params, gates on retrieval confidence, self-critiques the answer (one retry max). Each decision is a Phoenix span.
-
-9. **Contextual retrieval.** Anthropic's trick — each chunk gets an LLM-generated preamble describing where it sits in the doc, prepended *before* embedding. Cached by `sha1(chunk)`. Biggest single-step jump on hard questions. Collection: `rag_contextual`.
-
-10. **Semantic + parent-child chunking.** Two more strategies:
-     - Semantic — split where consecutive sentence embeddings drop in cosine (topic shift), bounded by min/max chars.
-     - Parent-child — index small (~300 char) children, return the surrounding (~1200 char) parent to the LLM.
-
-11. **PDF upload.** Drag a PDF into the sidebar, ingest into an in-memory Qdrant client, cache by `sha1(bytes)` so the same file is never re-parsed across sessions. OCR auto-detected per page via pdfplumber's text density.
 
 ## Stack
 
 | | |
 |---|---|
-| LLM | Gemini 2.5 Flash · Groq Llama 3.x · Ollama |
-| Embeddings | `BAAI/bge-small-en-v1.5` via Hugging Face `sentence-transformers` (local, 384-dim) |
-| Reranker | `BAAI/bge-reranker-v2-m3` via Hugging Face (local, cross-encoder) |
-| Vector store | Qdrant (embedded, persistent) |
-| PDF | Docling (layout) + pdfplumber (text-only + OCR check) |
+| LLM | Gemini 2.5 Flash · Groq · Ollama |
+| Embeddings | `bge-small-en-v1.5` (Hugging Face `sentence-transformers`, 384-dim) |
+| Reranker | `bge-reranker-v2-m3` (cross-encoder) |
+| Vector store | Qdrant (embedded) |
+| PDF parsing | Docling + pdfplumber |
 | Tracing | Arize Phoenix / OpenTelemetry |
 | Evals | RAGAS (via LangChain wrappers) |
 | UI | Streamlit |
-
-Chat orchestration is hand-written across 6 files so the data flow is visible end-to-end.
 
 ## Layout
 
@@ -70,18 +72,10 @@ retrieve.py       dense / BM25 / RRF / cross-encoder
 generate.py       provider dispatch, streaming, query rewriting
 ingest.py         PDF → chunks → embed → Qdrant (5 strategies)
 agent.py          query classifier, retrieval gate, answer critic
-corpus/           drop PDFs here, re-run `make ingest`
-data/qdrant/      vector store (committed, pre-built for the Attention paper)
+corpus/           PDFs
+data/qdrant/      vector store (committed)
 evals/            RAGAS harness
-docs/             roadmap (TODO.md), example queries (queries.md)
+docs/             roadmap, example queries
 ```
-
-## Provider keys
-
-| | env var | source |
-|---|---|---|
-| Gemini | `GOOGLE_API_KEY` | aistudio.google.com/apikey (free) |
-| Groq | `GROQ_API_KEY` | console.groq.com/keys (free) |
-| Ollama | — | `brew install ollama && ollama pull llama3.1:8b && ollama serve` |
 
 [docs/TODO.md](docs/TODO.md) · [docs/queries.md](docs/queries.md)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from urllib import error as urlerr
@@ -93,6 +94,9 @@ def _GROQ_HEADERS(api_key: str) -> dict[str, str]:
     }
 
 
+_GROQ_MAX_RETRIES = 5
+
+
 def _call_groq(prompt: str, model_id: str, temperature: float, system: str | None) -> tuple[str, int, int]:
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
@@ -106,15 +110,27 @@ def _call_groq(prompt: str, model_id: str, temperature: float, system: str | Non
     body = json.dumps({
         "model": model_id, "messages": messages, "temperature": temperature,
     }).encode()
-    req = urlreq.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=body,
-        headers=_GROQ_HEADERS(api_key),
-    )
-    try:
-        data = json.loads(urlreq.urlopen(req, timeout=60).read())
-    except urlerr.HTTPError as e:
-        raise RuntimeError(f"Groq call failed ({e.code}): {e.read().decode(errors='ignore')}") from e
+
+    for attempt in range(_GROQ_MAX_RETRIES):
+        req = urlreq.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=body,
+            headers=_GROQ_HEADERS(api_key),
+        )
+        try:
+            data = json.loads(urlreq.urlopen(req, timeout=60).read())
+            break
+        except urlerr.HTTPError as e:
+            if e.code == 429 and attempt < _GROQ_MAX_RETRIES - 1:
+                retry_after = e.headers.get("retry-after") if e.headers else None
+                try:
+                    wait = float(retry_after) if retry_after else min(60.0, 2 ** attempt)
+                except ValueError:
+                    wait = min(60.0, 2 ** attempt)
+                print(f"  [groq 429] sleeping {wait:.1f}s before retry {attempt + 2}/{_GROQ_MAX_RETRIES}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Groq call failed ({e.code}): {e.read().decode(errors='ignore')}") from e
     text = (data["choices"][0]["message"].get("content") or "").strip()
     usage = data.get("usage") or {}
     return (

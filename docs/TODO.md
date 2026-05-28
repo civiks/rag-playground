@@ -3,50 +3,56 @@
 - [x] naive rag: docling → 1200-char sliding chunks → bge embeddings → qdrant cosine top-k → gemini
 - [x] structure-aware chunking: docling `HybridChunker`, `rag_docling_hybrid` collection
 - [x] hybrid retrieval: bm25 + dense, fused via rrf (k=60)
-- [x] cross-encoder rerank: `bge-reranker-v2-m3`, top-20 → top-k, MPS/CUDA aware
-- [x] query rewriting: hyde + multi-query, both feed into hybrid+rerank
+- [x] cross-encoder rerank: `bge-reranker-v2-m3`, top-20 → top-k
+- [x] query rewriting: hyde + multi-query
 - [x] multi-provider llm: gemini / groq / ollama via `provider:model_id` dispatch
-- [x] chat ui: `st.chat_message`, last N turns threaded, streaming for all 3 providers, under-the-hood panel per response
-- [x] adaptive agent: classify query → gate retrieval → self-critique → one retry max, `agent.*` phoenix spans
-- [x] ragas eval: `evals/eval_questions.json` + `evals/eval.py`, faithfulness / answer_relevancy / context_precision via ragas 0.3.x
-- [x] contextual retrieval: llm-generated preamble per hybrid chunk, prepended pre-embed, sha1 cache, `rag_contextual` collection
-- [x] semantic chunking: split where consecutive sentence embeddings drop in cosine (topic shift), bounded by min/max chars
+- [x] chat ui: streaming for all 3 providers, under-the-hood panel, inline citation chips with cited-sources preview
+- [x] adaptive RAG + CRAG-style correction + Self-RAG-style critique:
+    - classify_query picks retrieval/rerank/rewrite by question shape (Adaptive RAG)
+    - assess_retrieval gates on top score; retries with stronger strategy on weak retrieval (CRAG)
+    - reflect_on_answer LLM-critiques final answer faithfulness (Self-RAG-style)
+    - one retry max, every decision is an `agent.*` phoenix span
+- [x] ragas eval: `evals/eval_questions.json` + `evals/eval.py` via ragas 0.3.x
+- [x] contextual retrieval: llm-generated preamble per chunk, sha1 cache, `rag_contextual` collection
+- [x] semantic chunking: topic-shift via cosine drop between consecutive sentence embeddings
 - [x] parent-child chunking: index ~300-char children, return ~1200-char parents to the llm
-- [x] pdf upload: drag-and-drop, ingest into in-memory qdrant, sha1(bytes) cache across sessions
+- [x] pdf upload: drag-and-drop, in-memory qdrant, sha1(bytes) cache across sessions
 - [x] ocr auto-detection: pdfplumber text density per page, only invoke docling OCR where needed
+- [x] background model warmup: daemon thread loads embedder/reranker/qdrant on boot, thread-safe getters
 - [x] live deploy: streamlit community cloud, byo gemini key
 
 ### evals
-- [ ] publish RAGAS numbers in README — run `make eval`, paste the comparison table
+- [x] publish RAGAS numbers in README — comparison table across 4 configs
 - [ ] expand `eval_questions.json` to 50+ qs, balance across failure modes (jargon, paraphrase, multi-hop, refusal, numerical)
 - [ ] golden-set regression test in CI — fail PR if any metric drops > 3%
 - [ ] open-source benchmarks: MultiHopRAG, FinQA, HotpotQA dev subsets
 
 ### retrieval frontier
-- [ ] GraphRAG — entity/relation extraction at ingest, query over graph + vector hybrid for multi-hop questions
-- [ ] RAPTOR — recursive tree of chunk summaries, retrieve at the right level of abstraction
-- [ ] Self-RAG / Corrective-RAG — formal "should I retrieve?" gate + per-chunk relevance filter before reranking
-- [ ] ColBERT late-interaction reranker — token-level matching, often beats cross-encoder on long contexts
-- [ ] late chunking — embed the full doc with a long-context embedder, then chunk the resulting token embeddings
-- [ ] metadata filtering — date / section / source-type filters applied before vector search
+- [ ] complete CRAG — web search fallback (DuckDuckGo, no key) for the "weak retrieval" branch
+- [ ] GraphRAG — entity/relation extraction at ingest, knowledge graph + community summaries (Leiden), graph-aware retrieval (~1-2 days)
+- [ ] RAPTOR — recursive tree of chunk summaries via clustering + LLM summarization (~4-6 hours)
+- [ ] formal Self-RAG — fine-tuned reflection tokens (Retrieve / IsRel / IsSup / IsUse) replacing prompted critique
+- [ ] ColBERT late-interaction reranker — token-level matching
+- [ ] late chunking — embed the full doc, then chunk the resulting token embeddings
+- [ ] metadata filtering — date / section / source-type filters before vector search
 
 ### production hardening
-- [ ] clickable citations — answer span → highlight source chunk in a side panel
+- [ ] clickable citations — answer span scrolls to / highlights the source chunk
 - [ ] semantic query cache — sha1(normalized query + config) → cached answer + sources, ttl-based
-- [ ] cost/latency in UI — token count + $ per turn, latency breakdown per stage
+- [ ] cost / latency in UI — token count + $ per turn, latency breakdown per stage
 - [ ] provider fallback chain — gemini 429 → groq → ollama, log the demotion as a span
-- [ ] conversational query rewriting — reformulate the question using chat history before retrieval
+- [ ] conversational query rewriting — reformulate question using chat history before retrieval
 - [ ] cost guardrails — soft warning > N tokens, hard refuse > M
 
 ### observability
 - [ ] phoenix dashboards saved view — latency p50/p95, faithfulness over time, retrieval recall@k
-- [ ] user feedback — thumbs up/down per answer, written to the trace, queryable in phoenix
-- [ ] failure-mode autotagging — agent labels each turn (refusal / jargon-miss / hallucination / partial) for dashboard slicing
+- [ ] user feedback — thumbs up/down per answer, written to the trace
+- [ ] failure-mode autotagging — refusal / jargon-miss / hallucination / partial
 
 ### infra / dx
 - [ ] unit tests for chunking strategies (deterministic, no model calls)
 - [ ] github actions: ruff + pytest + tiny eval on PR
-- [ ] docker compose for local dev (app + phoenix in one `docker compose up`)
+- [ ] docker compose for local dev (app + phoenix)
 - [ ] type checking — pyright strict on `retrieve.py`, `agent.py`, `rag.py`
 
 ### nice-to-haves

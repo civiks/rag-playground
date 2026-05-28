@@ -142,10 +142,23 @@ def score_ragas(results: list[dict], llm, embeddings) -> dict:
         return {}
 
     dataset = EvaluationDataset(samples=samples)
-    metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision()]
-    run_config = RunConfig(max_workers=4, timeout=120)
+    metrics = [Faithfulness(), AnswerRelevancy(strictness=1), ContextPrecision()]
+    run_config = RunConfig(max_workers=1, timeout=300, max_retries=10, max_wait=60)
     result = evaluate(dataset=dataset, metrics=metrics, llm=llm, embeddings=embeddings, run_config=run_config)
-    return dict(result)
+
+    out: dict = {}
+    for m in metrics:
+        name = getattr(m, "name", None) or m.__class__.__name__.lower()
+        try:
+            out[name] = float(result[name])
+        except (KeyError, TypeError, ValueError):
+            try:
+                df = result.to_pandas()
+                if name in df.columns:
+                    out[name] = float(df[name].dropna().mean())
+            except Exception:
+                pass
+    return out
 
 
 def _print_table(results: list[dict], ragas_scores: dict, config_tag: str) -> None:
