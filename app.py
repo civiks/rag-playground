@@ -478,9 +478,21 @@ for entry in st.session_state.history:
         _render_details(entry)
 
 
+def _is_substantive(q: str | None) -> bool:
+    if not q:
+        return False
+    s = q.strip()
+    letters = sum(c.isalpha() for c in s)
+    return len(s) >= 3 and letters >= 2 and len(set(s.lower())) >= 3
+
+
 question = st.chat_input("Ask a question about your documents")
 if not question and st.session_state.get("pending_question"):
     question = st.session_state.pop("pending_question")
+
+if question and not _is_substantive(question):
+    st.toast("Add a few more words.")
+    question = None
 
 if question:
     history_pairs = (
