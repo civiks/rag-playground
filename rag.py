@@ -17,7 +17,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-from generate import Answer, generate, rewrite_to_hyde, rewrite_to_multi
+from generate import MODEL as DEFAULT_MODEL, Answer, generate, rewrite_to_hyde, rewrite_to_multi
 from retrieve import (
     DEFAULT_COLLECTION,
     PREFETCH_N,
@@ -62,6 +62,7 @@ class RagResult:
     rerank: bool
     rewrite: str
     rewritten_queries: list[str]
+    model: str
 
 
 def answer(
@@ -71,13 +72,16 @@ def answer(
     strategy: str = "dense",
     rerank: bool = False,
     rewrite: str = "off",
+    model: str = DEFAULT_MODEL,
 ) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
     fetch_k = PREFETCH_N if rerank else k
     chunking_tag = collection.removeprefix("rag_")
     rerank_tag = "rerank" if rerank else "norerank"
-    span_name = f"rag.pipeline [{chunking_tag} · {strategy} · rewrite={rewrite} · {rerank_tag} · k={k}]"
+    provider, model_id = (model.split(":", 1) if ":" in model else ("gemini", model))
+    model_tag = f"{provider}/{model_id.removeprefix('gemini-')}"
+    span_name = f"rag.pipeline [{model_tag} · {chunking_tag} · {strategy} · rewrite={rewrite} · {rerank_tag} · k={k}]"
     with tracer.start_as_current_span(span_name) as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", question)
@@ -86,6 +90,7 @@ def answer(
         span.set_attribute("retrieval.strategy", strategy)
         span.set_attribute("retrieval.rerank", rerank)
         span.set_attribute("retrieval.rewrite", rewrite)
+        span.set_attribute("llm.model_name", model)
 
         # 1. Optional query rewriting — LLM transforms the question before retrieval.
         retrieval_queries: list[str]
@@ -95,7 +100,7 @@ def answer(
                 rw_span.set_attribute("openinference.span.kind", "CHAIN")
                 rw_span.set_attribute("input.value", question)
                 rw_span.set_attribute("rewrite.strategy", "hyde")
-                hypothetical = rewrite_to_hyde(question)
+                hypothetical = rewrite_to_hyde(question, model=model)
                 rewritten_queries = [hypothetical]
                 rw_span.set_attribute("output.value", hypothetical)
             retrieval_queries = [hypothetical]
@@ -104,7 +109,7 @@ def answer(
                 rw_span.set_attribute("openinference.span.kind", "CHAIN")
                 rw_span.set_attribute("input.value", question)
                 rw_span.set_attribute("rewrite.strategy", "multi")
-                paraphrases = rewrite_to_multi(question, n=3)
+                paraphrases = rewrite_to_multi(question, n=3, model=model)
                 rewritten_queries = paraphrases
                 rw_span.set_attribute("output.value", "\n".join(paraphrases))
             retrieval_queries = [question, *paraphrases]
@@ -161,7 +166,7 @@ def answer(
         with tracer.start_as_current_span("rag.generate") as g_span:
             g_span.set_attribute("openinference.span.kind", "CHAIN")
             g_span.set_attribute("input.value", question)
-            ans = generate(question, hits)
+            ans = generate(question, hits, model=model)
             g_span.set_attribute("output.value", ans.text)
             g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
             g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
@@ -175,7 +180,7 @@ def answer(
     return RagResult(
         question=question, answer=ans, hits=hits,
         latency_s=latency_s, collection=collection, strategy=strategy, rerank=rerank,
-        rewrite=rewrite, rewritten_queries=rewritten_queries,
+        rewrite=rewrite, rewritten_queries=rewritten_queries, model=model,
     )
 
 

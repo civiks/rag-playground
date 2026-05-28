@@ -16,6 +16,14 @@ def _warm() -> bool:
 
 _warm()
 
+MODEL_OPTIONS = {
+    "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
+    "Gemini 2.5 Flash Lite": "gemini:gemini-2.5-flash-lite",
+    "Groq Llama 3.3 70B": "groq:llama-3.3-70b-versatile",
+    "Groq Llama 3.1 8B (fast)": "groq:llama-3.1-8b-instant",
+    "Ollama llama3.1:8b (local)": "ollama:llama3.1:8b",
+}
+
 CHUNKING_STRATEGIES = {
     "Naive (1200-char sliding)": "naive_1200",
     "Docling hybrid (structure-aware)": "docling_hybrid",
@@ -44,6 +52,13 @@ st.caption("Gemini · BGE embeddings · Qdrant · Phoenix traces on :6006")
 
 with st.sidebar:
     st.header("Strategy")
+    model_label = st.selectbox(
+        "Model",
+        list(MODEL_OPTIONS.keys()),
+        help="Gemini needs GOOGLE_API_KEY. Groq needs GROQ_API_KEY (free at console.groq.com). Ollama needs `ollama serve` running locally with the model pulled.",
+    )
+    model = MODEL_OPTIONS[model_label]
+
     chunking_label = st.selectbox(
         "Chunking",
         list(CHUNKING_STRATEGIES.keys()),
@@ -97,11 +112,16 @@ if "history" not in st.session_state:
 
 if submitted and question:
     with st.spinner("Retrieving + generating ..."):
-        result = answer(
-            question, k=k, collection=f"rag_{chunking}", strategy=retrieval,
-            rerank=rerank, rewrite=rewrite,
-        )
+        try:
+            result = answer(
+                question, k=k, collection=f"rag_{chunking}", strategy=retrieval,
+                rerank=rerank, rewrite=rewrite, model=model,
+            )
+        except RuntimeError as e:
+            st.error(str(e))
+            st.stop()
     st.session_state.history.insert(0, {
+        "model_label": model_label,
         "chunking_label": chunking_label,
         "retrieval_label": retrieval_label,
         "rerank_label": rerank_label,
@@ -129,7 +149,7 @@ def _render(entry: dict) -> None:
         else:
             st.warning("Model didn't cite any chunks — possible hallucination or refusal.")
         st.caption(
-            f"Model: {result.answer.model} · "
+            f"Model: {entry['model_label']} ({result.answer.model}) · "
             f"Chunking: {entry['chunking_label']} · "
             f"Retrieval: {entry['retrieval_label']} · "
             f"Rerank: {entry['rerank_label']} · "
@@ -163,7 +183,7 @@ for idx, entry in enumerate(st.session_state.history):
     q_short = result.question if len(result.question) <= 70 else result.question[:67] + "..."
     header = (
         f"Q: {q_short}  ·  "
-        f"{entry['chunking_label']} / {entry['retrieval_label']} / "
+        f"{entry['model_label']} / {entry['chunking_label']} / {entry['retrieval_label']} / "
         f"rerank={entry['rerank_label']} / rewrite={entry['rewrite_label']}  ·  "
         f"k={entry['k']}  ·  "
         f"{result.latency_s:.2f}s  ·  "
