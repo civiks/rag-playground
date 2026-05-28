@@ -308,7 +308,7 @@ def _build_prompt(question: str, context: str, history: list[tuple[str, str]] | 
     parts: list[str] = []
     if history:
         parts.append("Recent conversation (most recent last):\n")
-        for user_q, assistant_a in history[-4:]:
+        for user_q, assistant_a in history:
             short_a = assistant_a if len(assistant_a) <= 600 else assistant_a[:600] + "…"
             parts.append(f"User: {user_q}\nAssistant: {short_a}\n\n")
         parts.append("---\n\n")
