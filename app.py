@@ -118,7 +118,7 @@ def _ingest_strategy(
     chunking: str,
     _files_data: tuple[tuple[str, bytes], ...],
     _status=None,
-) -> QdrantClient:
+) -> tuple[QdrantClient, list[tuple[str, str]]]:
     embedder = _get_embedder()
     dim = embedder.get_embedding_dimension()
     client = QdrantClient(":memory:")
@@ -129,28 +129,37 @@ def _ingest_strategy(
 
     pooled: list[tuple[str, str]] = []
     pooled_pc: list[tuple[str, dict]] = []
+    skipped: list[tuple[str, str]] = []
     n_files = len(_files_data)
 
     for i, (name, data) in enumerate(_files_data, 1):
         prefix = f"[{i}/{n_files}] {name}"
         ext = Path(name).suffix.lower()
-        if chunking == "docling_hybrid":
-            _step(f"{prefix} — parsing layout with Docling")
-            _, hybrid_chunks = _docling_parse_bytes(data, ext)
-            pooled.extend((name, c) for c in hybrid_chunks)
-        elif chunking == "parent_child":
-            _step(f"{prefix} — extracting text")
-            text = _get_plain_text(data, ext)
-            pooled_pc.extend((name, d) for d in chunks_parent_child(text))
-        elif chunking == "semantic":
-            _step(f"{prefix} — extracting text")
-            text = _get_plain_text(data, ext)
-            _step(f"{prefix} — semantic split (per-sentence embeddings)")
-            pooled.extend((name, c) for c in chunks_semantic(text, embedder))
-        else:  # naive_1200
-            _step(f"{prefix} — extracting text")
-            text = _get_plain_text(data, ext)
-            pooled.extend((name, c) for c in chunks_naive(text))
+        try:
+            if chunking == "docling_hybrid":
+                _step(f"{prefix} — parsing layout with Docling")
+                _, hybrid_chunks = _docling_parse_bytes(data, ext)
+                pooled.extend((name, c) for c in hybrid_chunks)
+            elif chunking == "parent_child":
+                _step(f"{prefix} — extracting text")
+                text = _get_plain_text(data, ext)
+                pooled_pc.extend((name, d) for d in chunks_parent_child(text))
+            elif chunking == "semantic":
+                _step(f"{prefix} — extracting text")
+                text = _get_plain_text(data, ext)
+                _step(f"{prefix} — semantic split (per-sentence embeddings)")
+                pooled.extend((name, c) for c in chunks_semantic(text, embedder))
+            else:  # naive_1200
+                _step(f"{prefix} — extracting text")
+                text = _get_plain_text(data, ext)
+                pooled.extend((name, c) for c in chunks_naive(text))
+        except Exception as e:
+            skipped.append((name, str(e)))
+            _step(f"{prefix} — skipped ({e})")
+
+    if not pooled and not pooled_pc:
+        msg = "No files could be parsed:\n" + "\n".join(f"  • {n}: {e}" for n, e in skipped)
+        raise RuntimeError(msg)
 
     col = f"upload_{chunking}"
     client.create_collection(col, vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
@@ -173,7 +182,7 @@ def _ingest_strategy(
             for i, ((s, c), v) in enumerate(zip(pooled, vecs))
         ])
 
-    return client
+    return client, skipped
 
 MODEL_OPTIONS = {
     "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
@@ -496,14 +505,17 @@ if question:
         if active_chunking not in built:
             with st.status(f"Indexing for **{active_chunking}** (first time)…", expanded=True) as status:
                 try:
-                    active_client = _ingest_strategy(combined_hash, active_chunking, files_data, _status=status)
-                    status.update(label="Indexed", state="complete", expanded=False)
+                    active_client, skipped = _ingest_strategy(combined_hash, active_chunking, files_data, _status=status)
+                    suffix = f" ({len(skipped)} skipped)" if skipped else ""
+                    status.update(label=f"Indexed{suffix}", state="complete", expanded=False)
                     built.add(active_chunking)
                 except Exception as e:
                     status.update(label=str(e), state="error")
                     st.stop()
+            for name, err in skipped:
+                st.warning(f"Skipped **{name}**: {err}")
         else:
-            active_client = _ingest_strategy(combined_hash, active_chunking, files_data)
+            active_client, _ = _ingest_strategy(combined_hash, active_chunking, files_data)
         active_collection = f"upload_{active_chunking}"
     else:
         active_collection = f"rag_{chunking}"
