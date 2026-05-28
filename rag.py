@@ -33,6 +33,7 @@ from retrieve import (
     PREFETCH_N,
     RERANKER_MODEL,
     Hit,
+    QdrantClient,
     rerank_hits,
     retrieve,
     rrf_fuse,
@@ -58,15 +59,19 @@ def _init_phoenix() -> trace.Tracer:
         _initialized = True
         return _tracer  # type: ignore[return-value]
 
-    import contextlib, io
-    from phoenix.otel import register
+    try:
+        import contextlib, io
+        from phoenix.otel import register
 
-    os.environ.setdefault("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        provider = register(project_name="rag-playground", auto_instrument=False)
-    GoogleGenAIInstrumentor().instrument(tracer_provider=provider)
+        os.environ.setdefault("PHOENIX_COLLECTOR_ENDPOINT", "http://localhost:6006")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            provider = register(project_name="rag-playground", auto_instrument=False)
+        GoogleGenAIInstrumentor().instrument(tracer_provider=provider)
+        _tracer = provider.get_tracer(__name__)
+    except Exception:
+        # Phoenix not running — fall back to a no-op tracer so spans are silently dropped.
+        _tracer = trace.get_tracer(__name__)
 
-    _tracer = provider.get_tracer(__name__)
     _initialized = True
     return _tracer  # type: ignore[return-value]
 
@@ -129,11 +134,11 @@ def _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, mo
         span.set_attribute("chat.history.turns", len(history))
 
 
-def _agent_classify(tracer, question, model) -> Strategy:
+def _agent_classify(tracer, question, model, api_key=None) -> Strategy:
     with tracer.start_as_current_span("agent.classify") as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", question)
-        decision = classify_query(question, model=model)
+        decision = classify_query(question, model=model, api_key=api_key)
         span.set_attribute("output.value", json.dumps({
             "retrieval": decision.retrieval, "rerank": decision.rerank,
             "rewrite": decision.rewrite, "reasoning": decision.reasoning,
@@ -156,11 +161,11 @@ def _agent_assess(tracer, hits, strategy_obj) -> Assessment:
         return assessment
 
 
-def _agent_reflect(tracer, question, answer_text, hits, model) -> Reflection:
+def _agent_reflect(tracer, question, answer_text, hits, model, api_key=None) -> Reflection:
     with tracer.start_as_current_span("agent.reflect") as span:
         span.set_attribute("openinference.span.kind", "CHAIN")
         span.set_attribute("input.value", answer_text)
-        reflection = reflect_on_answer(question, answer_text, hits, model=model)
+        reflection = reflect_on_answer(question, answer_text, hits, model=model, api_key=api_key)
         span.set_attribute("output.value", json.dumps({
             "faithful": reflection.faithful, "critique": reflection.critique,
         }))
@@ -176,6 +181,8 @@ def _run_retrieval(
     rerank: bool,
     rewrite: str,
     model: str,
+    client: QdrantClient | None = None,
+    api_key: str | None = None,
 ) -> tuple[list[Hit], list[str]]:
     """Shared rewrite + retrieve + rerank pipeline. Returns (hits, rewritten_queries)."""
     fetch_k = PREFETCH_N if rerank else k
@@ -187,7 +194,7 @@ def _run_retrieval(
             rw_span.set_attribute("openinference.span.kind", "CHAIN")
             rw_span.set_attribute("input.value", question)
             rw_span.set_attribute("rewrite.strategy", "hyde")
-            hypothetical = rewrite_to_hyde(question, model=model)
+            hypothetical = rewrite_to_hyde(question, model=model, api_key=api_key)
             rewritten_queries = [hypothetical]
             rw_span.set_attribute("output.value", hypothetical)
         retrieval_queries = [hypothetical]
@@ -196,7 +203,7 @@ def _run_retrieval(
             rw_span.set_attribute("openinference.span.kind", "CHAIN")
             rw_span.set_attribute("input.value", question)
             rw_span.set_attribute("rewrite.strategy", "multi")
-            paraphrases = rewrite_to_multi(question, n=3, model=model)
+            paraphrases = rewrite_to_multi(question, n=3, model=model, api_key=api_key)
             rewritten_queries = paraphrases
             rw_span.set_attribute("output.value", "\n".join(paraphrases))
         retrieval_queries = [question, *paraphrases]
@@ -210,10 +217,10 @@ def _run_retrieval(
         r_span.set_attribute("retrieval.strategy", strategy)
         r_span.set_attribute("retrieval.query_count", len(retrieval_queries))
         if len(retrieval_queries) == 1:
-            hits = retrieve(retrieval_queries[0], k=fetch_k, collection=collection, strategy=strategy)
+            hits = retrieve(retrieval_queries[0], k=fetch_k, collection=collection, strategy=strategy, client=client)
         else:
             rankings = [
-                retrieve(q, k=fetch_k, collection=collection, strategy=strategy)
+                retrieve(q, k=fetch_k, collection=collection, strategy=strategy, client=client)
                 for q in retrieval_queries
             ]
             hits = rrf_fuse(rankings, k=fetch_k)
@@ -262,6 +269,8 @@ def answer(
     model: str = DEFAULT_MODEL,
     history: list[tuple[str, str]] | None = None,
     mode: Literal["manual", "auto"] = "manual",
+    api_key: str | None = None,
+    client: QdrantClient | None = None,
 ) -> RagResult:
     tracer = _init_phoenix()
     start = time.perf_counter()
@@ -275,11 +284,12 @@ def answer(
         _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode)
 
         if mode == "auto":
-            agent_decision = _agent_classify(tracer, question, model)
+            agent_decision = _agent_classify(tracer, question, model, api_key=api_key)
             strategy, rerank, rewrite = agent_decision.retrieval, agent_decision.rerank, agent_decision.rewrite
 
         hits, rewritten_queries = _run_retrieval(
-            tracer, question, k, collection, strategy, rerank, rewrite, model
+            tracer, question, k, collection, strategy, rerank, rewrite, model,
+            client=client, api_key=api_key,
         )
 
         if mode == "auto":
@@ -289,31 +299,33 @@ def answer(
                 rs = agent_assessment.retry_strategy
                 strategy, rerank, rewrite = rs.retrieval, rs.rerank, rs.rewrite
                 hits, rewritten_queries = _run_retrieval(
-                    tracer, question, k, collection, strategy, rerank, rewrite, model
+                    tracer, question, k, collection, strategy, rerank, rewrite, model,
+                    client=client, api_key=api_key,
                 )
                 agent_retried = True
 
         with tracer.start_as_current_span("rag.generate") as g_span:
             g_span.set_attribute("openinference.span.kind", "CHAIN")
             g_span.set_attribute("input.value", question)
-            ans = generate(question, hits, model=model, history=history)
+            ans = generate(question, hits, model=model, history=history, api_key=api_key)
             g_span.set_attribute("output.value", ans.text)
             g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
             g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
 
         if mode == "auto" and not agent_retried:
-            agent_reflection = _agent_reflect(tracer, question, ans.text, hits, model)
+            agent_reflection = _agent_reflect(tracer, question, ans.text, hits, model, api_key=api_key)
             if not agent_reflection.faithful:
                 stronger = stronger_strategy(Strategy(retrieval=strategy, rerank=rerank, rewrite=rewrite, reasoning=""))
                 if stronger is not None:
                     strategy, rerank, rewrite = stronger.retrieval, stronger.rerank, stronger.rewrite
                     hits, rewritten_queries = _run_retrieval(
-                        tracer, question, k, collection, strategy, rerank, rewrite, model
+                        tracer, question, k, collection, strategy, rerank, rewrite, model,
+                        client=client, api_key=api_key,
                     )
                     with tracer.start_as_current_span("rag.generate.retry") as g_span:
                         g_span.set_attribute("openinference.span.kind", "CHAIN")
                         g_span.set_attribute("input.value", question)
-                        ans = generate(question, hits, model=model, history=history)
+                        ans = generate(question, hits, model=model, history=history, api_key=api_key)
                         g_span.set_attribute("output.value", ans.text)
                         g_span.set_attribute("llm.token_count.prompt", ans.input_tokens)
                         g_span.set_attribute("llm.token_count.completion", ans.output_tokens)
@@ -345,6 +357,8 @@ def answer_stream(
     history: list[tuple[str, str]] | None = None,
     usage_out: dict | None = None,
     mode: Literal["manual", "auto"] = "manual",
+    api_key: str | None = None,
+    client: QdrantClient | None = None,
 ) -> Iterator:
     """Streaming variant. Yields a RetrievalMeta first, then token-delta strings.
 
@@ -374,11 +388,12 @@ def answer_stream(
         _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode)
 
         if mode == "auto":
-            agent_decision = _agent_classify(tracer, question, model)
+            agent_decision = _agent_classify(tracer, question, model, api_key=api_key)
             strategy, rerank, rewrite = agent_decision.retrieval, agent_decision.rerank, agent_decision.rewrite
 
         hits, rewritten_queries = _run_retrieval(
-            tracer, question, k, collection, strategy, rerank, rewrite, model
+            tracer, question, k, collection, strategy, rerank, rewrite, model,
+            client=client, api_key=api_key,
         )
 
         if mode == "auto":
@@ -388,7 +403,8 @@ def answer_stream(
                 rs = agent_assessment.retry_strategy
                 strategy, rerank, rewrite = rs.retrieval, rs.rerank, rs.rewrite
                 hits, rewritten_queries = _run_retrieval(
-                    tracer, question, k, collection, strategy, rerank, rewrite, model
+                    tracer, question, k, collection, strategy, rerank, rewrite, model,
+                    client=client, api_key=api_key,
                 )
                 agent_retried = True
 
@@ -404,7 +420,7 @@ def answer_stream(
             g_span.set_attribute("openinference.span.kind", "CHAIN")
             g_span.set_attribute("input.value", question)
             full_text = ""
-            for delta in generate_stream(question, hits, model=model, history=history, usage_out=usage_out):
+            for delta in generate_stream(question, hits, model=model, history=history, usage_out=usage_out, api_key=api_key):
                 full_text += delta
                 yield delta
             g_span.set_attribute("output.value", full_text)
@@ -414,7 +430,7 @@ def answer_stream(
         citations = [i for i in range(1, len(hits) + 1) if f"[{i}]" in full_text]
 
         if mode == "auto":
-            reflection = _agent_reflect(tracer, question, full_text, hits, model)
+            reflection = _agent_reflect(tracer, question, full_text, hits, model, api_key=api_key)
             usage_out["agent_reflection"] = {
                 "faithful": reflection.faithful, "critique": reflection.critique,
             }

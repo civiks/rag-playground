@@ -1,7 +1,12 @@
 """Streamlit chat UI for the RAG pipeline. Run: `uv run streamlit run app.py`."""
 from __future__ import annotations
 
+import io
+import os
+
 import streamlit as st
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from rag import answer_stream
 from retrieve import _get_client, _get_embedder
@@ -15,6 +20,47 @@ def _warm() -> bool:
 
 
 _warm()
+
+
+def _ingest_upload(pdf_bytes: bytes, embedder) -> QdrantClient:
+    """Parse an uploaded PDF, chunk it, embed it, and return an in-memory Qdrant client.
+
+    Uses pypdf for parsing (no ML models) so hosted deployments don't need Docling.
+    Simple sliding-window chunking matches the naive_1200 strategy.
+    """
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    # Sliding-window chunks (1200 chars, 200 overlap) — same as naive_1200 strategy.
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = start + 1200
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - 200
+
+    if not chunks:
+        raise RuntimeError("Could not extract text from the uploaded PDF. Try a text-based PDF.")
+
+    vectors = embedder.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
+
+    client = QdrantClient(":memory:")
+    client.create_collection(
+        "upload_session",
+        vectors_config=VectorParams(size=len(vectors[0]), distance=Distance.COSINE),
+    )
+    client.upsert(
+        "upload_session",
+        points=[
+            PointStruct(id=i, vector=vec.tolist(), payload={"text": chunk, "source": "upload", "chunk_idx": i})
+            for i, (chunk, vec) in enumerate(zip(chunks, vectors))
+        ],
+    )
+    return client
 
 MODEL_OPTIONS = {
     "Gemini 2.5 Flash": "gemini:gemini-2.5-flash",
@@ -56,7 +102,55 @@ st.set_page_config(page_title="RAG Playground", layout="wide")
 st.title("RAG Playground")
 st.caption("Gemini · Groq · Ollama · BGE embeddings · Qdrant · Phoenix traces on :6006")
 
+if st.session_state.get("upload_filename"):
+    st.info(f"Chatting with: **{st.session_state['upload_filename']}** (uploaded) — remove the file in the sidebar to switch back to the pre-loaded corpus.")
+
 with st.sidebar:
+    st.header("API Keys")
+    _env_gemini = os.environ.get("GOOGLE_API_KEY", "")
+    _env_groq = os.environ.get("GROQ_API_KEY", "")
+    gemini_key_input = st.text_input(
+        "Gemini API key",
+        value=_env_gemini,
+        type="password",
+        help="Free key from aistudio.google.com — never stored beyond this browser session.",
+    )
+    groq_key_input = st.text_input(
+        "Groq API key (optional)",
+        value=_env_groq,
+        type="password",
+        help="Free key from console.groq.com — needed only when a Groq model is selected.",
+    )
+    # Runtime keys: prefer sidebar input, fall back to env var.
+    _gemini_api_key: str | None = gemini_key_input.strip() or None
+    _groq_api_key: str | None = groq_key_input.strip() or None
+    # Write Groq key back to env so the urllib-based Groq calls find it.
+    if _groq_api_key:
+        os.environ["GROQ_API_KEY"] = _groq_api_key
+
+    st.divider()
+    st.header("PDF")
+    uploaded_file = st.file_uploader("Upload a PDF to chat with", type="pdf")
+    if uploaded_file is not None:
+        if st.session_state.get("upload_filename") != uploaded_file.name:
+            with st.status(f"Ingesting {uploaded_file.name}…"):
+                try:
+                    session_client = _ingest_upload(uploaded_file.read(), _get_embedder())
+                    st.session_state.upload_client = session_client
+                    st.session_state.upload_filename = uploaded_file.name
+                    st.session_state.history = []
+                    st.success(f"Ready — {uploaded_file.name}")
+                except Exception as e:
+                    st.error(str(e))
+                    st.session_state.pop("upload_client", None)
+                    st.session_state.pop("upload_filename", None)
+    elif "upload_filename" in st.session_state:
+        # File was removed from the uploader — reset back to the pre-loaded corpus.
+        st.session_state.pop("upload_client", None)
+        st.session_state.pop("upload_filename", None)
+        st.session_state.history = []
+
+    st.divider()
     st.header("Strategy")
     model_label = st.selectbox(
         "Model",
@@ -214,13 +308,18 @@ for entry in st.session_state.history:
         _render_details(entry)
 
 
-if question := st.chat_input("Ask a question about the corpus"):
+if question := st.chat_input("Ask a question about your PDF"):
     # Thread the most-recent turns into the prompt as conversation context.
     history_pairs = (
         [(e["question"], e["answer_text"]) for e in st.session_state.history[-history_turns:]]
         if history_turns > 0
         else None
     )
+
+    # When a PDF is uploaded, use its in-memory collection; otherwise use the sidebar selection.
+    upload_client: QdrantClient | None = st.session_state.get("upload_client")
+    active_collection = "upload_session" if upload_client else f"rag_{chunking}"
+    active_client = upload_client  # None → retrieve.py uses the global (cloud/local) client
 
     with st.chat_message("user"):
         st.markdown(question)
@@ -231,9 +330,10 @@ if question := st.chat_input("Ask a question about the corpus"):
             spinner_msg = "Agent thinking..." if auto else "Retrieving..."
             with st.spinner(spinner_msg):
                 gen = answer_stream(
-                    question, k=k, collection=f"rag_{chunking}", strategy=retrieval,
+                    question, k=k, collection=active_collection, strategy=retrieval,
                     rerank=rerank, rewrite=rewrite, model=model,
                     history=history_pairs, usage_out=usage_out, mode=mode,
+                    api_key=_gemini_api_key, client=active_client,
                 )
                 meta = next(gen)              # classify/retrieve/assess (and maybe retry) happen here
             answer_text = st.write_stream(gen)  # then stream LLM tokens; reflect runs after

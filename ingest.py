@@ -155,7 +155,12 @@ def main() -> None:
 
     active_strategies = STRATEGIES
 
-    client = QdrantClient(path=str(QDRANT_PATH))
+    qdrant_url = os.environ.get("QDRANT_URL")
+    if qdrant_url:
+        client = QdrantClient(url=qdrant_url, api_key=os.environ.get("QDRANT_API_KEY"))
+        print(f"Using Qdrant Cloud: {qdrant_url}")
+    else:
+        client = QdrantClient(path=str(QDRANT_PATH))
     for strategy in active_strategies:
         client.recreate_collection(
             collection_name=f"rag_{strategy}",

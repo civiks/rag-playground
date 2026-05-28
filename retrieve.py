@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,7 +59,11 @@ def _get_reranker() -> CrossEncoder:
 def _get_client() -> QdrantClient:
     global _client
     if _client is None:
-        _client = QdrantClient(path=str(QDRANT_PATH))
+        url = os.environ.get("QDRANT_URL")
+        if url:
+            _client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
+        else:
+            _client = QdrantClient(path=str(QDRANT_PATH))
     return _client
 
 
@@ -69,14 +74,15 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
-def _get_bm25(collection: str) -> tuple[BM25Okapi, list[dict]]:
-    if collection in _bm25_cache:
-        return _bm25_cache[collection]
-    client = _get_client()
+def _get_bm25(collection: str, client: QdrantClient | None = None) -> tuple[BM25Okapi, list[dict]]:
+    cache_key = (collection, id(client) if client is not None else "global")
+    if cache_key in _bm25_cache:
+        return _bm25_cache[cache_key]
+    c = client or _get_client()
     payloads: list[dict] = []
     offset = None
     while True:
-        records, offset = client.scroll(
+        records, offset = c.scroll(
             collection_name=collection, limit=1000, offset=offset, with_payload=True, with_vectors=False
         )
         payloads.extend(r.payload for r in records)
@@ -84,23 +90,23 @@ def _get_bm25(collection: str) -> tuple[BM25Okapi, list[dict]]:
             break
     corpus = [_tokenize(p["text"]) for p in payloads]
     bm25 = BM25Okapi(corpus)
-    _bm25_cache[collection] = (bm25, payloads)
+    _bm25_cache[cache_key] = (bm25, payloads)
     return bm25, payloads
 
 
-def _retrieve_dense(query: str, k: int, collection: str) -> list[Hit]:
+def _retrieve_dense(query: str, k: int, collection: str, client: QdrantClient | None = None) -> list[Hit]:
     embedder = _get_embedder()
-    client = _get_client()
+    c = client or _get_client()
     vec = embedder.encode([query], normalize_embeddings=True)[0].tolist()
-    res = client.query_points(collection_name=collection, query=vec, limit=k).points
+    res = c.query_points(collection_name=collection, query=vec, limit=k).points
     return [
         Hit(text=p.payload["text"], source=p.payload["source"], chunk_idx=p.payload["chunk_idx"], score=p.score)
         for p in res
     ]
 
 
-def _retrieve_bm25(query: str, k: int, collection: str) -> list[Hit]:
-    bm25, payloads = _get_bm25(collection)
+def _retrieve_bm25(query: str, k: int, collection: str, client: QdrantClient | None = None) -> list[Hit]:
+    bm25, payloads = _get_bm25(collection, client=client)
     scores = bm25.get_scores(_tokenize(query))
     top = sorted(range(len(payloads)), key=lambda i: -scores[i])[:k]
     return [
@@ -126,12 +132,18 @@ def rrf_fuse(rankings: list[list[Hit]], k: int) -> list[Hit]:
     return out
 
 
-def retrieve(query: str, k: int = 5, collection: str = DEFAULT_COLLECTION, strategy: str = "dense") -> list[Hit]:
+def retrieve(
+    query: str,
+    k: int = 5,
+    collection: str = DEFAULT_COLLECTION,
+    strategy: str = "dense",
+    client: QdrantClient | None = None,
+) -> list[Hit]:
     if strategy == "hybrid":
-        dense = _retrieve_dense(query, k=PREFETCH_N, collection=collection)
-        bm25 = _retrieve_bm25(query, k=PREFETCH_N, collection=collection)
+        dense = _retrieve_dense(query, k=PREFETCH_N, collection=collection, client=client)
+        bm25 = _retrieve_bm25(query, k=PREFETCH_N, collection=collection, client=client)
         return rrf_fuse([dense, bm25], k=k)
-    return _retrieve_dense(query, k=k, collection=collection)
+    return _retrieve_dense(query, k=k, collection=collection, client=client)
 
 
 def rerank_hits(query: str, hits: list[Hit], k: int) -> list[Hit]:

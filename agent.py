@@ -119,10 +119,10 @@ def _extract_json(text: str) -> dict:
     raise ValueError("unbalanced JSON in output")
 
 
-def classify_query(question: str, model: str) -> Strategy:
+def classify_query(question: str, model: str, api_key: str | None = None) -> Strategy:
     prompt = CLASSIFY_PROMPT % question
     try:
-        text, _, _ = _dispatch(prompt, model=model, temperature=0.0)
+        text, _, _ = _dispatch(prompt, model=model, temperature=0.0, api_key=api_key)
         obj = _extract_json(text)
         retrieval = obj.get("retrieval", "hybrid")
         if retrieval not in ("dense", "hybrid"):
@@ -203,11 +203,11 @@ def assess_retrieval(
     return Assessment(ok=True, reason=f"top score {top:.3f} above threshold", retry_strategy=None)
 
 
-def reflect_on_answer(question: str, answer_text: str, hits: list[Hit], model: str) -> Reflection:
+def reflect_on_answer(question: str, answer_text: str, hits: list[Hit], model: str, api_key: str | None = None) -> Reflection:
     context = "\n\n---\n\n".join(f"[{i}] {h.text}" for i, h in enumerate(hits, start=1))
     prompt = REFLECT_PROMPT % (question, context, answer_text)
     try:
-        text, _, _ = _dispatch(prompt, model=model, temperature=0.0)
+        text, _, _ = _dispatch(prompt, model=model, temperature=0.0, api_key=api_key)
         obj = _extract_json(text)
         return Reflection(
             faithful=bool(obj.get("faithful", True)),

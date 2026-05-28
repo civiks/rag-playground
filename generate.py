@@ -42,16 +42,20 @@ class Answer:
 _gemini_client: genai.Client | None = None
 
 
-def _gemini_client_or_die() -> genai.Client:
+def _gemini_client_or_die(api_key: str | None = None) -> genai.Client:
+    # If a runtime key is provided (e.g. from the UI), create a fresh client — don't cache it
+    # so different users on the same process each get their own authenticated client.
+    if api_key:
+        return genai.Client(api_key=api_key)
     global _gemini_client
     if _gemini_client is None:
-        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
+        key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not key:
             raise RuntimeError(
-                "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in .env. "
+                "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in .env — or enter your key in the sidebar. "
                 "Get one free at https://aistudio.google.com/apikey"
             )
-        _gemini_client = genai.Client(api_key=api_key)
+        _gemini_client = genai.Client(api_key=key)
     return _gemini_client
 
 
@@ -63,8 +67,8 @@ def _split_model(model: str) -> tuple[str, str]:
     return provider, model_id
 
 
-def _call_gemini(prompt: str, model_id: str, temperature: float, system: str | None) -> tuple[str, int, int]:
-    client = _gemini_client_or_die()
+def _call_gemini(prompt: str, model_id: str, temperature: float, system: str | None, api_key: str | None = None) -> tuple[str, int, int]:
+    client = _gemini_client_or_die(api_key=api_key)
     cfg = (
         types.GenerateContentConfig(temperature=temperature, system_instruction=system)
         if system
@@ -138,10 +142,10 @@ def _call_ollama(prompt: str, model_id: str, temperature: float, system: str | N
     )
 
 
-def _dispatch(prompt: str, model: str, temperature: float, system: str | None = None) -> tuple[str, int, int]:
+def _dispatch(prompt: str, model: str, temperature: float, system: str | None = None, api_key: str | None = None) -> tuple[str, int, int]:
     provider, model_id = _split_model(model)
     if provider == "gemini":
-        return _call_gemini(prompt, model_id, temperature, system)
+        return _call_gemini(prompt, model_id, temperature, system, api_key=api_key)
     if provider == "groq":
         return _call_groq(prompt, model_id, temperature, system)
     if provider == "ollama":
@@ -149,8 +153,8 @@ def _dispatch(prompt: str, model: str, temperature: float, system: str | None = 
     raise ValueError(f"Unknown LLM provider: {provider!r} (model={model!r})")
 
 
-def _stream_gemini(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict) -> Iterator[str]:
-    client = _gemini_client_or_die()
+def _stream_gemini(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict, api_key: str | None = None) -> Iterator[str]:
+    client = _gemini_client_or_die(api_key=api_key)
     cfg = (
         types.GenerateContentConfig(temperature=temperature, system_instruction=system)
         if system
@@ -248,12 +252,12 @@ def _stream_ollama(prompt: str, model_id: str, temperature: float, system: str |
             break
 
 
-def _stream_dispatch(prompt: str, model: str, temperature: float, system: str | None = None, usage_out: dict | None = None) -> Iterator[str]:
+def _stream_dispatch(prompt: str, model: str, temperature: float, system: str | None = None, usage_out: dict | None = None, api_key: str | None = None) -> Iterator[str]:
     if usage_out is None:
         usage_out = {}
     provider, model_id = _split_model(model)
     if provider == "gemini":
-        yield from _stream_gemini(prompt, model_id, temperature, system, usage_out)
+        yield from _stream_gemini(prompt, model_id, temperature, system, usage_out, api_key=api_key)
     elif provider == "groq":
         yield from _stream_groq(prompt, model_id, temperature, system, usage_out)
     elif provider == "ollama":
@@ -292,7 +296,7 @@ def _build_prompt(question: str, context: str, history: list[tuple[str, str]] | 
 _rewrite_cache: dict[tuple[str, str, str], list[str]] = {}
 
 
-def rewrite_to_hyde(question: str, model: str = MODEL) -> str:
+def rewrite_to_hyde(question: str, model: str = MODEL, api_key: str | None = None) -> str:
     """Generate a hypothetical answer so its embedding matches chunk-shape, not question-shape.
 
     HyDE bet: questions and answers live in different regions of embedding space.
@@ -309,12 +313,12 @@ def rewrite_to_hyde(question: str, model: str = MODEL) -> str:
         "Do NOT say you're hypothetical. Output only the paragraph.\n\n"
         f"Question: {question}"
     )
-    text, _, _ = _dispatch(prompt, model=model, temperature=0.3)
+    text, _, _ = _dispatch(prompt, model=model, temperature=0.3, api_key=api_key)
     _rewrite_cache[cache_key] = [text]
     return text
 
 
-def rewrite_to_multi(question: str, n: int = 3, model: str = MODEL) -> list[str]:
+def rewrite_to_multi(question: str, n: int = 3, model: str = MODEL, api_key: str | None = None) -> list[str]:
     """Generate N paraphrases of the question covering different lexical angles."""
     cache_key = (question, f"multi_{n}", model)
     if cache_key in _rewrite_cache:
@@ -326,7 +330,7 @@ def rewrite_to_multi(question: str, n: int = 3, model: str = MODEL) -> list[str]
         "rewrite per line, no numbering, no preface, no quotes.\n\n"
         f"Question: {question}"
     )
-    text, _, _ = _dispatch(prompt, model=model, temperature=0.7)
+    text, _, _ = _dispatch(prompt, model=model, temperature=0.7, api_key=api_key)
     lines = [ln.strip().lstrip("-*0123456789. )") for ln in text.split("\n") if ln.strip()]
     lines = lines[:n]
     _rewrite_cache[cache_key] = lines
@@ -338,10 +342,11 @@ def generate(
     hits: list[Hit],
     model: str = MODEL,
     history: list[tuple[str, str]] | None = None,
+    api_key: str | None = None,
 ) -> Answer:
     context = _format_context(hits)
     prompt = _build_prompt(question, context, history)
-    text, in_tok, out_tok = _dispatch(prompt, model=model, temperature=0.2, system=SYSTEM)
+    text, in_tok, out_tok = _dispatch(prompt, model=model, temperature=0.2, system=SYSTEM, api_key=api_key)
     citations = [i for i in range(1, len(hits) + 1) if f"[{i}]" in text]
     return Answer(
         text=text, model=model, citations_used=citations,
@@ -355,8 +360,9 @@ def generate_stream(
     model: str = MODEL,
     history: list[tuple[str, str]] | None = None,
     usage_out: dict | None = None,
+    api_key: str | None = None,
 ) -> Iterator[str]:
     """Stream token deltas. usage_out (if passed) is populated with token counts at end."""
     context = _format_context(hits)
     prompt = _build_prompt(question, context, history)
-    yield from _stream_dispatch(prompt, model=model, temperature=0.2, system=SYSTEM, usage_out=usage_out)
+    yield from _stream_dispatch(prompt, model=model, temperature=0.2, system=SYSTEM, usage_out=usage_out, api_key=api_key)
