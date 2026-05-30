@@ -16,9 +16,11 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import hashlib
+import io
 import json
 import re
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -117,6 +119,29 @@ def _get_docling_data(doc_path: str, ext: str | None = None) -> tuple[str, list[
     DOCLING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file.write_text(json.dumps({"markdown": markdown, "hybrid_chunks": hybrid_chunks}))
     return markdown, hybrid_chunks
+
+
+def parse_upload_docling(data: bytes, ext: str) -> tuple[str, list[str]]:
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+        f.write(data)
+        tmp = f.name
+    return _get_docling_data(tmp, ext)
+
+
+def parse_upload_text(data: bytes, ext: str) -> str:
+    ext = ext.lower()
+    if ext in PLAIN_TEXT_EXTS:
+        text = data.decode("utf-8", errors="replace")
+    elif ext == ".pdf":
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    else:
+        markdown, _ = parse_upload_docling(data, ext)
+        text = markdown
+    if not text.strip():
+        raise RuntimeError(f"Could not extract text from {ext} file.")
+    return text
 
 
 def chunks_naive(markdown: str) -> list[str]:

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import os
-import re
-import tempfile
 import threading
 from pathlib import Path
 
@@ -12,9 +9,13 @@ import streamlit as st
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
-from ingest import chunks_naive, chunks_parent_child, chunks_semantic
+from ingest import chunks_naive, chunks_parent_child, chunks_semantic, parse_upload_docling, parse_upload_text
 from rag import answer_stream
 from retrieve import _get_client, _get_embedder, _get_reranker
+from ui import (
+    EXAMPLE_QUESTIONS_CORPUS, EXAMPLE_QUESTIONS_UPLOAD,
+    render_citations, render_cited_sources, render_details, render_empty_state,
+)
 
 
 @st.cache_resource(show_spinner=False)
@@ -33,78 +34,6 @@ def _start_background_warmup() -> bool:
 _start_background_warmup()
 
 
-_CITE_PATTERN = re.compile(r"\[(\d+)\]")
-
-_CHIP_STYLE = (
-    "color:#0a84ff;background:rgba(10,132,255,0.18);"
-    "padding:0 6px;border-radius:4px;margin:0 1px;"
-    "font-size:0.78em;font-weight:700;vertical-align:super;"
-    "line-height:1.4;text-decoration:none;"
-)
-
-
-def _render_citations(text: str, hits) -> str:
-    def replace(m: re.Match) -> str:
-        n = int(m.group(1))
-        if not (1 <= n <= len(hits)):
-            return m.group(0)
-        return f'<sup style="{_CHIP_STYLE}">[{n}]</sup>'
-    return _CITE_PATTERN.sub(replace, text)
-
-
-def _render_cited_sources(hits, citations: list[int]) -> None:
-    if not citations:
-        return
-    for n in citations:
-        if not (1 <= n <= len(hits)):
-            continue
-        h = hits[n - 1]
-        snippet = h.text.strip().replace("\n", " ")
-        if len(snippet) > 360:
-            snippet = snippet[:357] + "…"
-        st.markdown(
-            f'<div style="border-left:3px solid #0a84ff;background:rgba(10,132,255,0.08);'
-            f'padding:6px 10px;margin:4px 0;border-radius:0 4px 4px 0;'
-            f'font-size:0.85em;color:inherit;">'
-            f'<span style="color:#0a84ff;font-weight:700;">[{n}]</span> '
-            f'<span style="opacity:0.65;font-size:0.85em;">'
-            f'<code style="background:transparent;padding:0;">{_escape(h.source)}</code>'
-            f' · chunk {h.chunk_idx} · score {h.score:.2f}</span>'
-            f'<div style="margin-top:3px;color:inherit;opacity:0.92;">{_escape(snippet)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-
-def _escape(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-             .replace('"', "&quot;"))
-
-
-def _docling_parse_bytes(_data: bytes, ext: str) -> tuple[str, list[str]]:
-    from ingest import _get_docling_data
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-        f.write(_data)
-        tmp_path = f.name
-    return _get_docling_data(tmp_path, ext)
-
-
-def _get_plain_text(_data: bytes, ext: str) -> str:
-    ext = ext.lower()
-    from ingest import PLAIN_TEXT_EXTS
-
-    if ext in PLAIN_TEXT_EXTS:
-        text = _data.decode("utf-8", errors="replace")
-    elif ext == ".pdf":
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(_data)) as pdf:
-            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    else:
-        markdown, _ = _docling_parse_bytes(_data, ext)
-        text = markdown
-    if not text.strip():
-        raise RuntimeError(f"Could not extract text from {ext} file.")
-    return text
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
@@ -133,20 +62,20 @@ def _ingest_strategy(
         try:
             if chunking == "docling_hybrid":
                 _step(f"{prefix} — parsing layout with Docling")
-                _, hybrid_chunks = _docling_parse_bytes(data, ext)
+                _, hybrid_chunks = parse_upload_docling(data, ext)
                 pooled.extend((name, c) for c in hybrid_chunks)
             elif chunking == "parent_child":
                 _step(f"{prefix} — extracting text")
-                text = _get_plain_text(data, ext)
+                text = parse_upload_text(data, ext)
                 pooled_pc.extend((name, d) for d in chunks_parent_child(text))
             elif chunking == "semantic":
                 _step(f"{prefix} — extracting text")
-                text = _get_plain_text(data, ext)
+                text = parse_upload_text(data, ext)
                 _step(f"{prefix} — semantic split (per-sentence embeddings)")
                 pooled.extend((name, c) for c in chunks_semantic(text, embedder))
             else:  # naive_1200
                 _step(f"{prefix} — extracting text")
-                text = _get_plain_text(data, ext)
+                text = parse_upload_text(data, ext)
                 pooled.extend((name, c) for c in chunks_naive(text))
         except Exception as e:
             skipped.append((name, str(e)))
@@ -216,17 +145,6 @@ REWRITE_OPTIONS = {
     "Multi-query (3 paraphrases)": "multi",
 }
 
-EXAMPLE_QUESTIONS_CORPUS = [
-    "What is multi-head attention?",
-    "How does YOLO frame object detection differently?",
-    "Compare the encoder and decoder stacks.",
-]
-
-EXAMPLE_QUESTIONS_UPLOAD = [
-    "Summarise this document.",
-    "What are the key takeaways?",
-    "List the main sections.",
-]
 
 st.set_page_config(page_title="RAG Playground", layout="wide")
 
@@ -359,116 +277,23 @@ if "history" not in st.session_state:
     st.session_state.history = []
 
 
-def _render_details(entry: dict) -> None:
-    meta = entry["meta"]
-    citations = entry["citations"]
-    k_used = entry["k"]
-    n_cited = len(citations)
-    n_hits = len(meta.hits)
-    max_score = max((h.score for h in meta.hits), default=0.0)
-
-    auto_tag = " · **auto**" if entry.get("mode") == "auto" else ""
-    summary = (
-        f"{n_hits} chunks retrieved · {n_cited} cited · "
-        f"{entry['latency_s']:.2f}s · {entry['input_tokens']}+{entry['output_tokens']} tok"
-        f"{auto_tag}"
-    )
-    with st.expander(summary):
-        st.markdown(
-            f"**Model:** `{entry['model_label']}`  &nbsp;·&nbsp;  "
-            f"**Chunking:** `{entry['chunking_label']}`  &nbsp;·&nbsp;  "
-            f"**Retrieval:** `{meta.strategy}`  &nbsp;·&nbsp;  "
-            f"**Rerank:** `{meta.rerank}`  &nbsp;·&nbsp;  "
-            f"**Rewrite:** `{meta.rewrite}`  &nbsp;·&nbsp;  "
-            f"**k:** `{k_used}`"
-        )
-
-        decision = entry.get("agent_decision")
-        if decision is not None:
-            st.markdown(
-                f"**Agent decided** &nbsp; retrieval=`{decision.retrieval}` · "
-                f"rerank=`{decision.rerank}` · rewrite=`{decision.rewrite}`"
-            )
-            if decision.reasoning:
-                st.caption(f"_Reasoning:_ {decision.reasoning}")
-
-        assessment = entry.get("agent_assessment")
-        if assessment is not None:
-            verdict = "OK" if assessment.ok else "weak"
-            tail = " → retried with stronger strategy" if entry.get("agent_retried") else ""
-            st.caption(f"_Assessment:_ {verdict} — {assessment.reason}{tail}")
-
-        reflection = entry.get("agent_reflection")
-        if reflection is not None:
-            faithful = reflection.get("faithful") if isinstance(reflection, dict) else reflection.faithful
-            critique = reflection.get("critique") if isinstance(reflection, dict) else reflection.critique
-            verdict = "faithful" if faithful else "unfaithful"
-            st.caption(f"_Self-critique:_ {verdict} — {critique}")
-
-        if max_score < 0.4:
-            st.error(
-                f"Top score is only {max_score:.3f} — retrieval likely failed. "
-                "Try rephrasing using terms from the source."
-            )
-
-        if meta.rewritten_queries:
-            st.markdown(f"##### Rewritten queries ({meta.rewrite})")
-            for rq in meta.rewritten_queries:
-                st.markdown(f"- {rq}")
-
-        st.markdown(f"##### Retrieved chunks (top {n_hits})")
-        tab_labels = [
-            f"[{i}] {'✓' if i in citations else '·'}" for i in range(1, n_hits + 1)
-        ]
-        for tab, (i, h) in zip(st.tabs(tab_labels), enumerate(meta.hits, start=1)):
-            with tab:
-                used = i in citations
-                badge = "**CITED**" if used else "_unused_"
-                st.caption(f"{badge}  ·  `{h.source}` chunk `{h.chunk_idx}`  ·  score `{h.score:.3f}`")
-                st.text(h.text)
-
-
-def _render_empty_state() -> None:
-    has_upload = bool(st.session_state.get("upload_filenames"))
-    if has_upload:
-        names = st.session_state["upload_filenames"]
-        target = f"`{names[0]}`" if len(names) == 1 else f"your **{len(names)} documents**"
-        suggestions = EXAMPLE_QUESTIONS_UPLOAD
-    else:
-        target = "the pre-loaded papers"
-        suggestions = EXAMPLE_QUESTIONS_CORPUS
-
-    st.markdown(
-        f"<div style='text-align:center;padding:72px 0 20px;opacity:0.75;'>"
-        f"<div style='font-size:1.05em;'>Ask anything about {target}.</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    cols = st.columns(len(suggestions))
-    for col, q in zip(cols, suggestions):
-        with col:
-            if st.button(q, use_container_width=True, key=f"suggest_{hash(q)}"):
-                st.session_state["pending_question"] = q
-                st.rerun()
-
 
 if not st.session_state.history and not st.session_state.get("pending_question"):
-    _render_empty_state()
+    render_empty_state()
 
 for entry in st.session_state.history:
     with st.chat_message("user"):
         st.markdown(entry["question"])
     with st.chat_message("assistant"):
         st.markdown(
-            _render_citations(entry["answer_text"], entry["meta"].hits),
+            render_citations(entry["answer_text"], entry["meta"].hits),
             unsafe_allow_html=True,
         )
         if entry["citations"]:
-            _render_cited_sources(entry["meta"].hits, entry["citations"])
+            render_cited_sources(entry["meta"].hits, entry["citations"])
         else:
             st.info("Model didn't emit `[#]` markers — see the panel below for what was retrieved.")
-        _render_details(entry)
+        render_details(entry)
 
 
 def _is_substantive(q: str | None) -> bool:
@@ -548,13 +373,13 @@ if question:
             st.stop()
 
         answer_slot.markdown(
-            _render_citations(answer_text, meta.hits),
+            render_citations(answer_text, meta.hits),
             unsafe_allow_html=True,
         )
 
         citations = usage_out.get("citations", [])
         if citations:
-            _render_cited_sources(meta.hits, citations)
+            render_cited_sources(meta.hits, citations)
         else:
             st.info("Model didn't emit `[#]` markers — see the panel below for what was retrieved.")
 
@@ -563,13 +388,12 @@ if question:
             "answer_text": answer_text,
             "model_label": model_label,
             "chunking_label": active_chunking_label,
-            "retrieval_label": retrieval_label,
-            "rerank_label": rerank_label,
-            "rewrite_label": rewrite_label,
             "k": k,
             "mode": mode,
             "meta": meta,
             "latency_s": usage_out.get("latency_s", 0.0),
+            "retrieve_s": usage_out.get("retrieve_s", 0.0),
+            "generate_s": usage_out.get("generate_s", 0.0),
             "input_tokens": usage_out.get("input_tokens", 0),
             "output_tokens": usage_out.get("output_tokens", 0),
             "citations": citations,
@@ -578,6 +402,6 @@ if question:
             "agent_retried": meta.agent_retried,
             "agent_reflection": usage_out.get("agent_reflection"),
         }
-        _render_details(entry)
+        render_details(entry)
 
     st.session_state.history.append(entry)

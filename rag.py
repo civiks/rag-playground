@@ -387,6 +387,7 @@ def answer_stream(
     with tracer.start_as_current_span(_span_name(model, collection, strategy, rewrite, rerank, k)) as span:
         _set_root_attrs(span, question, k, collection, strategy, rerank, rewrite, model, history, mode)
 
+        _t_retrieve = time.perf_counter()
         if mode == "auto":
             agent_decision = _agent_classify(tracer, question, model, api_key=api_key)
             strategy, rerank, rewrite = agent_decision.retrieval, agent_decision.rerank, agent_decision.rewrite
@@ -408,6 +409,7 @@ def answer_stream(
                 )
                 agent_retried = True
 
+        usage_out["retrieve_s"] = time.perf_counter() - _t_retrieve
         yield RetrievalMeta(
             question=question, hits=hits, collection=collection,
             strategy=strategy, rerank=rerank, rewrite=rewrite,
@@ -416,6 +418,7 @@ def answer_stream(
             agent_assessment=agent_assessment, agent_retried=agent_retried,
         )
 
+        _t_generate = time.perf_counter()
         with tracer.start_as_current_span("rag.generate") as g_span:
             g_span.set_attribute("openinference.span.kind", "CHAIN")
             g_span.set_attribute("input.value", question)
@@ -423,6 +426,7 @@ def answer_stream(
             for delta in generate_stream(question, hits, model=model, history=history, usage_out=usage_out, api_key=api_key):
                 full_text += delta
                 yield delta
+            usage_out["generate_s"] = time.perf_counter() - _t_generate
             g_span.set_attribute("output.value", full_text)
             g_span.set_attribute("llm.token_count.prompt", usage_out.get("input_tokens", 0))
             g_span.set_attribute("llm.token_count.completion", usage_out.get("output_tokens", 0))
