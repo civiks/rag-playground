@@ -219,27 +219,30 @@ def _stream_groq(prompt: str, model_id: str, temperature: float, system: str | N
         resp = urlreq.urlopen(req, timeout=60)
     except urlerr.HTTPError as e:
         raise RuntimeError(f"Groq stream failed ({e.code}): {e.read().decode(errors='ignore')}") from e
-    for raw in resp:
-        line = raw.decode("utf-8", errors="ignore").strip()
-        if not line or not line.startswith("data: "):
-            continue
-        data = line[6:]
-        if data == "[DONE]":
-            break
-        try:
-            obj = json.loads(data)
-        except json.JSONDecodeError:
-            continue
-        usage = obj.get("usage")
-        if usage:
-            usage_out["input_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
-            usage_out["output_tokens"] = int(usage.get("completion_tokens", 0) or 0)
-        choices = obj.get("choices") or []
-        if not choices:
-            continue
-        delta = choices[0].get("delta", {}).get("content")
-        if delta:
-            yield delta
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            usage = obj.get("usage")
+            if usage:
+                usage_out["input_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
+                usage_out["output_tokens"] = int(usage.get("completion_tokens", 0) or 0)
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {}).get("content")
+            if delta:
+                yield delta
+    except Exception as e:
+        raise RuntimeError(f"Groq stream interrupted ({type(e).__name__}): {e}") from e
 
 
 def _stream_ollama(prompt: str, model_id: str, temperature: float, system: str | None, usage_out: dict) -> Iterator[str]:

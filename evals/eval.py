@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import os
 os.environ["RAG_NO_TRACE"] = "1"  # eval runs don't need Phoenix; avoids connection noise
 
 # ragas 0.3.x imports langchain_community.chat_models.vertexai at module level,
@@ -49,6 +48,8 @@ except ImportError as e:
     _RAGAS_ERR = str(e)
 
 from rag import answer
+from retrieve import retrieve as _retrieve, rerank_hits as _rerank_hits, PREFETCH_N
+from retrieval_metrics import score_retrieval
 
 QUESTIONS_FILE = Path(__file__).parent / "eval_questions.json"
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "data" / "eval"
@@ -86,6 +87,43 @@ def _build_eval_llm(model: str = "ollama:llama3.1:8b"):
     return llm, embeddings
 
 
+def run_retrieval_only(questions: list[dict], args: argparse.Namespace) -> list[dict]:
+    """Retrieve contexts without calling the LLM. Enables retrieval metrics with no API key."""
+    results = []
+    for i, q in enumerate(questions, start=1):
+        question = q["question"]
+        print(f"  [{i:>2}/{len(questions)}] {question[:65]}")
+        t0 = time.perf_counter()
+        try:
+            fetch_k = PREFETCH_N if args.rerank else args.k
+            hits = _retrieve(question, k=fetch_k, collection=f"rag_{args.chunking}", strategy=args.retrieval)
+            if args.rerank:
+                hits = _rerank_hits(question, hits, k=args.k)
+            results.append({
+                "type": q.get("type", ""),
+                "question": question,
+                "ground_truth": q.get("ground_truth", ""),
+                "gold_spans": q.get("gold_spans", []),
+                "answer": "",
+                "contexts": [h.text for h in hits],
+                "latency_s": round(time.perf_counter() - t0, 2),
+                "error": None,
+            })
+        except Exception as e:
+            print(f"      ERROR: {e}")
+            results.append({
+                "type": q.get("type", ""),
+                "question": question,
+                "ground_truth": q.get("ground_truth", ""),
+                "gold_spans": q.get("gold_spans", []),
+                "answer": "",
+                "contexts": [],
+                "latency_s": round(time.perf_counter() - t0, 2),
+                "error": str(e),
+            })
+    return results
+
+
 def run_pipeline(questions: list[dict], args: argparse.Namespace) -> list[dict]:
     results = []
     for i, q in enumerate(questions, start=1):
@@ -107,6 +145,7 @@ def run_pipeline(questions: list[dict], args: argparse.Namespace) -> list[dict]:
                 "type": q.get("type", ""),
                 "question": question,
                 "ground_truth": q.get("ground_truth", ""),
+                "gold_spans": q.get("gold_spans", []),
                 "answer": result.answer.text,
                 "contexts": [h.text for h in result.hits],
                 "latency_s": round(time.perf_counter() - t0, 2),
@@ -118,6 +157,7 @@ def run_pipeline(questions: list[dict], args: argparse.Namespace) -> list[dict]:
                 "type": q.get("type", ""),
                 "question": question,
                 "ground_truth": q.get("ground_truth", ""),
+                "gold_spans": q.get("gold_spans", []),
                 "answer": "",
                 "contexts": [],
                 "latency_s": round(time.perf_counter() - t0, 2),
@@ -161,7 +201,7 @@ def score_ragas(results: list[dict], llm, embeddings) -> dict:
     return out
 
 
-def _print_table(results: list[dict], ragas_scores: dict, config_tag: str) -> None:
+def _print_table(results: list[dict], ragas_scores: dict, retrieval_scores: dict, config_tag: str) -> None:
     print(f"\n{'=' * 72}")
     print(f"Config: {config_tag}")
     print(f"{'─' * 72}")
@@ -170,6 +210,20 @@ def _print_table(results: list[dict], ragas_scores: dict, config_tag: str) -> No
     for i, r in enumerate(results, start=1):
         err = " ERR" if r["error"] else ""
         print(f"  {i:>2}  {r['type']:<12} {r['latency_s']:>7.1f}s  {r['question'][:42]}{err}")
+
+    overall = retrieval_scores.get("overall", {})
+    if overall:
+        print(f"\n{'─' * 40}")
+        print(f"  Retrieval (n={retrieval_scores.get('n', '?')} scoreable questions)")
+        print(f"{'─' * 40}")
+        for key, label in [("recall@5", "Recall@5"), ("mrr", "MRR"), ("ndcg@5", "nDCG@5")]:
+            val = overall.get(key)
+            if val is not None:
+                print(f"  {label:<22} {val:.4f}")
+        per_type = retrieval_scores.get("per_type", {})
+        if per_type:
+            for qtype, scores in sorted(per_type.items()):
+                print(f"    {qtype:<14} R@5={scores.get('recall@5', 0):.2f}  MRR={scores.get('mrr', 0):.2f}  nDCG={scores.get('ndcg@5', 0):.2f}")
 
     if ragas_scores:
         print(f"\n{'─' * 40}")
@@ -194,7 +248,7 @@ def _print_table(results: list[dict], ragas_scores: dict, config_tag: str) -> No
     print(f"{'=' * 72}")
 
 
-def _save(results: list[dict], ragas_scores: dict, config_tag: str) -> Path:
+def _save(results: list[dict], ragas_scores: dict, retrieval_scores: dict, config_tag: str) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"{config_tag}.json"
 
@@ -208,6 +262,7 @@ def _save(results: list[dict], ragas_scores: dict, config_tag: str) -> Path:
     out.write_text(json.dumps({
         "config_tag": config_tag,
         "ragas_scores": serializable_scores,
+        "retrieval_scores": retrieval_scores,
         "n_questions": len(results),
         "n_errors": sum(1 for r in results if r["error"]),
         "per_question": results,
@@ -231,12 +286,9 @@ def main() -> None:
                         help="Only evaluate questions of this type")
     parser.add_argument("--eval-model", default="llama3.1:8b",
                         help="Ollama model ID used by RAGAS for scoring (separate from --model used for answers)")
+    parser.add_argument("--retrieval-only", action="store_true",
+                        help="Skip LLM generation; only retrieve and score retrieval metrics (no API key needed)")
     args = parser.parse_args()
-
-    if not _RAGAS_OK:
-        print(f"RAGAS not installed: {_RAGAS_ERR}")
-        print("Install: uv add ragas langchain-google-genai")
-        return
 
     questions = json.loads(QUESTIONS_FILE.read_text())
     if args.filter_type:
@@ -252,15 +304,25 @@ def main() -> None:
     print(f"Running eval: {config_tag}")
     print(f"Model: {args.model}  k={args.k}  n={len(questions)} questions\n")
 
-    results = run_pipeline(questions, args)
+    if args.retrieval_only:
+        results = run_retrieval_only(questions, args)
+    else:
+        results = run_pipeline(questions, args)
 
-    print(f"\nScoring with RAGAS (eval model: {args.eval_model}) ...")
-    eval_llm, eval_embeddings = _build_eval_llm(args.eval_model)
-    ragas_scores = score_ragas(results, eval_llm, eval_embeddings)
+    retrieval_scores = score_retrieval(results, k=args.k)
 
-    _print_table(results, ragas_scores, config_tag)
+    ragas_scores = {}
+    if not args.retrieval_only:
+        if _RAGAS_OK:
+            print(f"\nScoring with RAGAS (eval model: {args.eval_model}) ...")
+            eval_llm, eval_embeddings = _build_eval_llm(args.eval_model)
+            ragas_scores = score_ragas(results, eval_llm, eval_embeddings)
+        else:
+            print(f"\nRAGAS not available ({_RAGAS_ERR}) — skipping generation scoring.")
 
-    out = _save(results, ragas_scores, config_tag)
+    _print_table(results, ragas_scores, retrieval_scores, config_tag)
+
+    out = _save(results, ragas_scores, retrieval_scores, config_tag)
     print(f"Saved → {out.relative_to(Path.cwd())}")
 
 

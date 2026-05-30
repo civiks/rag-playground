@@ -40,7 +40,7 @@ Two PDFs are pre-loaded and the Qdrant index ships with the repo, so `make app` 
 
 ## Results
 
-RAGAS over `evals/eval_questions.json` (n=5, `llama-3.1-8b-instant` for both answering and scoring):
+RAGAS over `evals/eval_questions.json` (n=5, `llama-3.1-8b-instant` for both answering and scoring). Small sample — directional only.
 
 | Config | Faithfulness | Answer Relevancy | Context Precision |
 |---|---|---|---|
@@ -48,6 +48,18 @@ RAGAS over `evals/eval_questions.json` (n=5, `llama-3.1-8b-instant` for both ans
 | hybrid · rerank | 0.812 | 0.930 | 0.901 |
 | hybrid · rerank · multi-query | 0.844 | 0.938 | 0.868 |
 | contextual · hybrid · rerank · multi · auto | **1.000** | **0.921** | **0.983** |
+
+Retrieval-only metrics (`--retrieval-only`, no LLM needed) 24 scoreable questions, `docling_hybrid · hybrid · rerank`:
+
+| Type | Recall@5 | MRR | nDCG@5 |
+|---|---|---|---|
+| direct | 0.88 | 0.88 | 0.83 |
+| jargon | 1.00 | 0.87 | 0.88 |
+| paraphrased | 1.00 | 0.84 | 0.84 |
+| multi_hop | 0.80 | 0.80 | 0.78 |
+| **overall** | **0.92** | **0.85** | **0.84** |
+
+multi_hop trails every other type — the one persistent miss is a table-row question where the parameter counts (`65M`, `213M`) are split across chunk boundaries by the hybrid chunker.
 
 
 ## Stack

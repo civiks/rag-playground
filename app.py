@@ -1,4 +1,3 @@
-"""Streamlit chat UI for the RAG pipeline. Run: `uv run streamlit run app.py`."""
 from __future__ import annotations
 
 import hashlib
@@ -20,8 +19,6 @@ from retrieve import _get_client, _get_embedder, _get_reranker
 
 @st.cache_resource(show_spinner=False)
 def _start_background_warmup() -> bool:
-    """Load embedder, reranker, Qdrant client in a daemon thread so the UI renders
-    immediately. By the time the user types a question, models are already in memory."""
     def _warm() -> None:
         try:
             _get_embedder()
@@ -47,7 +44,6 @@ _CHIP_STYLE = (
 
 
 def _render_citations(text: str, hits) -> str:
-    """Turn inline `[N]` markers into small raised blue chips."""
     def replace(m: re.Match) -> str:
         n = int(m.group(1))
         if not (1 <= n <= len(hits)):
@@ -57,7 +53,6 @@ def _render_citations(text: str, hits) -> str:
 
 
 def _render_cited_sources(hits, citations: list[int]) -> None:
-    """Render a compact 'Cited sources' inline block below the answer."""
     if not citations:
         return
     for n in citations:
@@ -247,10 +242,6 @@ if upload_names:
 
 with st.sidebar:
     st.header("API Keys")
-    # Inputs are intentionally blank — never pre-fill from os.environ, because on
-    # Streamlit Cloud env vars come from the deploy's Secrets and would leak to every
-    # visitor. Backend calls still read from os.environ, so `.env` (local) and properly
-    # set secrets continue to work — they're just not surfaced in the UI.
     gemini_key_input = st.text_input(
         "Gemini API key",
         value="",
@@ -351,11 +342,13 @@ with st.sidebar:
         help="How many prior (user, assistant) turns to fold into the prompt as conversation context. 0 = stateless.",
     )
 
-    st.divider()
-    st.markdown(
-        "**Phoenix UI:** [localhost:6006](http://localhost:6006)\n\n"
-        "Open it to see traces, retrieved chunks, and LLM calls."
-    )
+    endpoint = os.environ.get("PHOENIX_COLLECTOR_ENDPOINT", "")
+    if endpoint and ("localhost" in endpoint or "127.0.0.1" in endpoint):
+        st.divider()
+        st.markdown(
+            "**Phoenix UI:** [localhost:6006](http://localhost:6006)\n\n"
+            "Open it to see traces, retrieved chunks, and LLM calls."
+        )
     st.divider()
     if st.button("Clear chat", use_container_width=True):
         st.session_state.history = []

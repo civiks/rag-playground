@@ -29,16 +29,19 @@
 
 ### retrieval frontier
 - [ ] complete CRAG — web search fallback (DuckDuckGo, no key) for the "weak retrieval" branch
-- [ ] GraphRAG — entity/relation extraction at ingest, knowledge graph + community summaries (Leiden), graph-aware retrieval (~1-2 days)
-- [ ] RAPTOR — recursive tree of chunk summaries via clustering + LLM summarization (~4-6 hours)
-- [ ] formal Self-RAG — fine-tuned reflection tokens (Retrieve / IsRel / IsSup / IsUse) replacing prompted critique
+- [ ] RAPTOR — recursive cluster+summarize tree, 6th chunking strategy
+- [ ] query decomposition — split multi-hop questions into sub-questions, retrieve per sub-question, RRF-fuse
+- [ ] GraphRAG — entity/relation extraction, knowledge graph + community summaries, graph-aware retrieval
+- [ ] Matryoshka embeddings — swap `bge-small` for an MRL model, ablate dims vs recall
+- [ ] ColPali — embed PDF pages as images, no OCR/chunking pipeline
+- [ ] LLM listwise reranker — RankGPT-style on top-10 after cross-encoder
 - [ ] ColBERT late-interaction reranker — token-level matching
-- [ ] late chunking — embed the full doc, then chunk the resulting token embeddings
+- [ ] late chunking — embed full doc, chunk the token embeddings
 - [ ] metadata filtering — date / section / source-type filters before vector search
+- [ ] semantic query cache — embed query, cosine-match against past Q→A pairs
 
 ### production hardening
 - [ ] clickable citations — answer span scrolls to / highlights the source chunk
-- [ ] semantic query cache — sha1(normalized query + config) → cached answer + sources, ttl-based
 - [ ] cost / latency in UI — token count + $ per turn, latency breakdown per stage
 - [ ] provider fallback chain — gemini 429 → groq → ollama, log the demotion as a span
 - [ ] conversational query rewriting — reformulate question using chat history before retrieval
